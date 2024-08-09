@@ -278,27 +278,8 @@ func (g *Generator) generate(typeName string) {
 		g.Printf("\t_ = x[%s - %s]\n", v.originalName, v.str)
 	}
 	g.Printf("}\n")
-	runs := splitIntoRuns(values)
-	// The decision of which pattern to use depends on the number of
-	// runs in the numbers. If there's only one, it's easy. For more than
-	// one, there's a tradeoff between complexity and size of the data
-	// and code vs. the simplicity of a map. A map takes more space,
-	// but so does the code. The decision here (crossover at 10) is
-	// arbitrary, but considers that for large numbers of runs the cost
-	// of the linear scan in the switch might become important, and
-	// rather than use yet another algorithm such as binary search,
-	// we punt and use a map. In any case, the likelihood of a map
-	// being necessary for any realistic example other than bitmasks
-	// is very low. And bitmasks probably deserve their own analysis,
-	// to be done some other day.
-	switch {
-	case len(runs) == 1:
-		g.buildOneRun(runs, typeName)
-	case len(runs) <= 10:
-		g.buildMultipleRuns(runs, typeName)
-	default:
-		g.buildMap(runs, typeName)
-	}
+	g.buildMap(splitIntoRuns(values), typeName)
+	g.buildParseFunc(typeName)
 }
 
 // splitIntoRuns breaks the values into runs of contiguous sequences.
@@ -656,5 +637,26 @@ const stringMap = `func (i %[1]s) String() string {
 		return str
 	}
 	return "%[1]s(" + strconv.FormatInt(int64(i), 10) + ")"
+}
+`
+
+func (g *Generator) buildParseFunc(typeName string) {
+	g.Printf("\n\n")
+	g.Printf(parseFunc, typeName)
+}
+
+const parseFunc = `
+func Parse%[1]s(s string) (%[1]s, bool) {
+  for k, v := range _%[1]s_map {
+    if s == v {
+      return k, true
+    }
+  }
+  return 0, false
+}
+
+func MustParse%[1]s(s string) %[1]s {
+  v, _ := Parse%[1]s(s)
+  return v
 }
 `
