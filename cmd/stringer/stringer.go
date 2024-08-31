@@ -149,7 +149,8 @@ func main() {
 	g.Printf("\n")
 	g.Printf("package %s", g.pkg.name)
 	g.Printf("\n")
-	g.Printf("import \"strconv\"\n") // Used by all methods.
+	g.Printf("import \"strconv\"\n")                      // Used by all methods.
+	g.Printf("import \"golang.org/x/exp/constraints\"\n") // Used by all methods.
 
 	// Run generate for each type.
 	for _, typeName := range types {
@@ -658,5 +659,13 @@ func Parse%[1]s(s string) (%[1]s, bool) {
 func MustParse%[1]s(s string) %[1]s {
   v, _ := Parse%[1]s(s)
   return v
+}
+
+func %[1]sSliceFromIntegers[T constraints.Integer](ts []T) []%[1]s {
+	ret := make([]%[1]s, 0, len(ts))
+	for _, t := range ts {
+		ret = append(ret, %[1]s(t))
+	}
+	return ret
 }
 `
