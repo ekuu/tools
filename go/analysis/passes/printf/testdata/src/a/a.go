@@ -154,6 +154,8 @@ func PrintfTests() {
 	fmt.Println("%v", "hi")                     // want "fmt.Println call has possible Printf formatting directive %v"
 	fmt.Println("%T", "hi")                     // want "fmt.Println call has possible Printf formatting directive %T"
 	fmt.Println("%s"+" there", "hi")            // want "fmt.Println call has possible Printf formatting directive %s"
+	fmt.Println("http://foo.com?q%2Fabc")       // no diagnostic: %XX is excepted
+	fmt.Println("http://foo.com?q%2Fabc-%s")    // want"fmt.Println call has possible Printf formatting directive %s"
 	fmt.Println("0.0%")                         // correct (trailing % couldn't be a formatting directive)
 	fmt.Printf("%s", "hi", 3)                   // want "fmt.Printf call needs 1 arg but has 2 args"
 	_ = fmt.Sprintf("%"+("s"), "hi", 3)         // want "fmt.Sprintf call needs 1 arg but has 2 args"
@@ -212,8 +214,8 @@ func PrintfTests() {
 	// Bad argument reorderings.
 	Printf("%[xd", 3)                      // want `a.Printf format %\[xd is missing closing \]`
 	Printf("%[x]d x", 3)                   // want `a.Printf format has invalid argument index \[x\]`
-	Printf("%[3]*s x", "hi", 2)            // want `a.Printf format has invalid argument index \[3\]`
-	_ = fmt.Sprintf("%[3]d x", 2)          // want `fmt.Sprintf format has invalid argument index \[3\]`
+	Printf("%[3]*s x", "hi", 2)            // want `a.Printf format %\[3]\*s reads arg #3, but call has 2 args`
+	_ = fmt.Sprintf("%[3]d x", 2)          // want `fmt.Sprintf format %\[3]d reads arg #3, but call has 1 arg`
 	Printf("%[2]*.[1]*[3]d x", 2, "hi", 4) // want `a.Printf format %\[2]\*\.\[1\]\*\[3\]d uses non-int \x22hi\x22 as argument of \*`
 	Printf("%[0]s x", "arg1")              // want `a.Printf format has invalid argument index \[0\]`
 	Printf("%[0]d x", 1)                   // want `a.Printf format has invalid argument index \[0\]`

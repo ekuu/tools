@@ -12,12 +12,16 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"regexp"
+	"strings"
 
+	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/protocol"
+	goplsastutil "golang.org/x/tools/gopls/internal/util/astutil"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/internal/event"
 )
@@ -81,6 +85,89 @@ func Definition(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, p
 		return locations, err // may be success or failure
 	}
 
+	// Handle definition requests for various special kinds of syntax node.
+	path, _ := astutil.PathEnclosingInterval(pgf.File, pos, pos)
+	switch node := path[0].(type) {
+	// Handle the case where the cursor is on a return statement by jumping to the result variables.
+	case *ast.ReturnStmt:
+		var funcType *ast.FuncType
+		for _, n := range path[1:] {
+			switch n := n.(type) {
+			case *ast.FuncLit:
+				funcType = n.Type
+			case *ast.FuncDecl:
+				funcType = n.Type
+			}
+			if funcType != nil {
+				break
+			}
+		}
+		// Inv: funcType != nil, as a return stmt cannot appear outside a function.
+		if funcType.Results == nil {
+			return nil, nil // no result variables
+		}
+		loc, err := pgf.NodeLocation(funcType.Results)
+		if err != nil {
+			return nil, err
+		}
+		return []protocol.Location{loc}, nil
+
+	case *ast.BranchStmt:
+		// Handle the case where the cursor is on a goto, break or continue statement by returning the
+		// location of the label, the closing brace of the relevant block statement, or the
+		// start of the relevant loop, respectively.
+		label, isLabeled := pkg.TypesInfo().Uses[node.Label].(*types.Label)
+		switch node.Tok {
+		case token.GOTO:
+			if isLabeled {
+				loc, err := pgf.PosLocation(label.Pos(), label.Pos()+token.Pos(len(label.Name())))
+				if err != nil {
+					return nil, err
+				}
+				return []protocol.Location{loc}, nil
+			} else {
+				// Workaround for #70957.
+				// TODO(madelinekalil): delete when go1.25 fixes it.
+				return nil, nil
+			}
+		case token.BREAK, token.CONTINUE:
+			// Find innermost relevant ancestor for break/continue.
+			for i, n := range path[1:] {
+				if isLabeled {
+					l, ok := path[1:][i+1].(*ast.LabeledStmt)
+					if !(ok && l.Label.Name == label.Name()) {
+						continue
+					}
+				}
+				switch n.(type) {
+				case *ast.ForStmt, *ast.RangeStmt:
+					var start, end token.Pos
+					if node.Tok == token.BREAK {
+						start, end = n.End()-token.Pos(len("}")), n.End()
+					} else { // CONTINUE
+						start, end = n.Pos(), n.Pos()+token.Pos(len("for"))
+					}
+					loc, err := pgf.PosLocation(start, end)
+					if err != nil {
+						return nil, err
+					}
+					return []protocol.Location{loc}, nil
+				case *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt:
+					if node.Tok == token.BREAK {
+						loc, err := pgf.PosLocation(n.End()-1, n.End())
+						if err != nil {
+							return nil, err
+						}
+						return []protocol.Location{loc}, nil
+					}
+				case *ast.FuncDecl, *ast.FuncLit:
+					// bad syntax; avoid jumping outside the current function
+					return nil, nil
+				}
+			}
+		}
+	}
+
 	// The general case: the cursor is on an identifier.
 	_, obj, _ := referencedObject(pkg, pgf, pos)
 	if obj == nil {
@@ -90,6 +177,18 @@ func Definition(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, p
 	// Built-ins have no position.
 	if isBuiltin(obj) {
 		return builtinDefinition(ctx, snapshot, obj)
+	}
+
+	// Non-go (e.g. assembly) symbols
+	//
+	// When already at the definition of a Go function without
+	// a body, we jump to its non-Go (C or assembly) definition.
+	for _, decl := range pgf.File.Decls {
+		if decl, ok := decl.(*ast.FuncDecl); ok &&
+			decl.Body == nil &&
+			goplsastutil.NodeContains(decl.Name, pos) {
+			return nonGoDefinition(ctx, snapshot, pkg, decl.Name.Name)
+		}
 	}
 
 	// Finally, map the object position.
@@ -173,6 +272,10 @@ func builtinDecl(ctx context.Context, snapshot *cache.Snapshot, obj types.Object
 	if obj.Pkg() == types.Unsafe {
 		// package "unsafe":
 		// parse $GOROOT/src/unsafe/unsafe.go
+		//
+		// (Strictly, we shouldn't assume that the ID of a std
+		// package is its PkgPath, but no Bazel+gopackagesdriver
+		// users have complained about this yet.)
 		unsafe := snapshot.Metadata("unsafe")
 		if unsafe == nil {
 			// If the type checker somehow resolved 'unsafe', we must have metadata
@@ -348,4 +451,41 @@ func mapPosition(ctx context.Context, fset *token.FileSet, s file.Source, start,
 	}
 	m := protocol.NewMapper(fh.URI(), content)
 	return m.PosLocation(file, start, end)
+}
+
+// nonGoDefinition returns the location of the definition of a non-Go symbol.
+// Only assembly is supported for now.
+func nonGoDefinition(ctx context.Context, snapshot *cache.Snapshot, pkg *cache.Package, symbol string) ([]protocol.Location, error) {
+	// Examples:
+	//   TEXT runtime·foo(SB)
+	//   TEXT ·foo<ABIInternal>(SB)
+	// TODO(adonovan): why does ^TEXT cause it not to match?
+	pattern := regexp.MustCompile("TEXT\\b.*·(" + regexp.QuoteMeta(symbol) + ")[\\(<]")
+
+	for _, uri := range pkg.Metadata().OtherFiles {
+		if strings.HasSuffix(uri.Path(), ".s") {
+			fh, err := snapshot.ReadFile(ctx, uri)
+			if err != nil {
+				return nil, err // context cancelled
+			}
+			content, err := fh.Content()
+			if err != nil {
+				continue // can't read file
+			}
+			if match := pattern.FindSubmatchIndex(content); match != nil {
+				mapper := protocol.NewMapper(uri, content)
+				loc, err := mapper.OffsetLocation(match[2], match[3])
+				if err != nil {
+					return nil, err
+				}
+				return []protocol.Location{loc}, nil
+			}
+		}
+	}
+
+	// TODO(adonovan): try C files
+
+	// This may be reached for functions that aren't implemented
+	// in assembly (e.g. compiler intrinsics like getg).
+	return nil, fmt.Errorf("can't find non-Go definition of %s", symbol)
 }

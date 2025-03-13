@@ -2,6 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:generate go run resolver_gen.go
+
+// The parsego package defines the [File] type, a wrapper around a go/ast.File
+// that is useful for answering LSP queries. Notably, it bundles the
+// *token.File and *protocol.Mapper necessary for token.Pos locations to and
+// from UTF-16 LSP positions.
+//
+// Run `go generate` to update resolver.go from GOROOT.
 package parsego
 
 import (
@@ -13,11 +21,14 @@ import (
 	"go/scanner"
 	"go/token"
 	"reflect"
+	"slices"
 
+	"golang.org/x/tools/go/ast/inspector"
 	"golang.org/x/tools/gopls/internal/label"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/astutil"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
+	"golang.org/x/tools/internal/astutil/cursor"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/event"
 )
@@ -51,15 +62,13 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 		// We passed a byte slice, so the only possible error is a parse error.
 		parseErr = err.(scanner.ErrorList)
 	}
+	// Inv: file != nil.
 
-	tok := fset.File(file.Pos())
-	if tok == nil {
-		// file.Pos is the location of the package declaration (issue #53202). If there was
-		// none, we can't find the token.File that ParseFile created, and we
-		// have no choice but to recreate it.
-		tok = fset.AddFile(uri.Path(), -1, len(src))
-		tok.SetLinesForContent(src)
+	tokenFile := func(file *ast.File) *token.File {
+		return fset.File(file.FileStart)
 	}
+
+	tok := tokenFile(file)
 
 	fixedSrc := false
 	fixedAST := false
@@ -88,15 +97,13 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 			}
 
 			newFile, newErr := parser.ParseFile(fset, uri.Path(), newSrc, mode)
-			if newFile == nil {
-				break // no progress
-			}
+			assert(newFile != nil, "ParseFile returned nil") // I/O error can't happen
 
 			// Maintain the original parseError so we don't try formatting the
 			// doctored file.
 			file = newFile
 			src = newSrc
-			tok = fset.File(file.Pos())
+			tok = tokenFile(file)
 
 			// Only now that we accept the fix do we record the src fix from above.
 			fixes = append(fixes, srcFix)
@@ -114,6 +121,12 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 			}
 		}
 	}
+	assert(file != nil, "nil *ast.File")
+
+	// Provide a cursor for fast and convenient navigation.
+	inspect := inspector.New([]*ast.File{file})
+	curFile, _ := cursor.Root(inspect).FirstChild()
+	_ = curFile.Node().(*ast.File)
 
 	return &File{
 		URI:      uri,
@@ -123,6 +136,7 @@ func Parse(ctx context.Context, fset *token.FileSet, uri protocol.DocumentURI, s
 		fixedAST: fixedAST,
 		File:     file,
 		Tok:      tok,
+		Cursor:   curFile,
 		Mapper:   protocol.NewMapper(uri, src),
 		ParseErr: parseErr,
 	}, fixes
@@ -514,11 +528,12 @@ func fixInitStmt(bad *ast.BadExpr, parent ast.Node, tok *token.File, src []byte)
 	}
 
 	// Try to extract a statement from the BadExpr.
-	start, end, err := safetoken.Offsets(tok, bad.Pos(), bad.End()-1)
+	start, end, err := safetoken.Offsets(tok, bad.Pos(), bad.End())
 	if err != nil {
 		return false
 	}
-	stmtBytes := src[start : end+1]
+	assert(end <= len(src), "offset overflow") // golang/go#72026
+	stmtBytes := src[start:end]
 	stmt, err := parseStmt(tok, bad.Pos(), stmtBytes)
 	if err != nil {
 		return false
@@ -592,27 +607,17 @@ func readKeyword(pos token.Pos, tok *token.File, src []byte) string {
 func fixArrayType(bad *ast.BadExpr, parent ast.Node, tok *token.File, src []byte) bool {
 	// Our expected input is a bad expression that looks like "[]someExpr".
 
-	from := bad.Pos()
-	to := bad.End()
-
-	if !from.IsValid() || !to.IsValid() {
-		return false
-	}
-
-	exprBytes := make([]byte, 0, int(to-from)+3)
-	// Avoid doing tok.Offset(to) since that panics if badExpr ends at EOF.
-	// It also panics if the position is not in the range of the file, and
-	// badExprs may not necessarily have good positions, so check first.
-	fromOffset, toOffset, err := safetoken.Offsets(tok, from, to-1)
+	from, to := bad.Pos(), bad.End()
+	fromOffset, toOffset, err := safetoken.Offsets(tok, from, to)
 	if err != nil {
 		return false
 	}
-	exprBytes = append(exprBytes, src[fromOffset:toOffset+1]...)
-	exprBytes = bytes.TrimSpace(exprBytes)
+
+	exprBytes := bytes.TrimSpace(slices.Clone(src[fromOffset:toOffset]))
 
 	// If our expression ends in "]" (e.g. "[]"), add a phantom selector
 	// so we can complete directly after the "[]".
-	if len(exprBytes) > 0 && exprBytes[len(exprBytes)-1] == ']' {
+	if bytes.HasSuffix(exprBytes, []byte("]")) {
 		exprBytes = append(exprBytes, '_')
 	}
 
@@ -824,7 +829,7 @@ func parseStmt(tok *token.File, pos token.Pos, src []byte) (ast.Stmt, error) {
 
 	// Use ParseFile instead of ParseExpr because ParseFile has
 	// best-effort behavior, whereas ParseExpr fails hard on any error.
-	fakeFile, err := parser.ParseFile(token.NewFileSet(), "", fileSrc, 0)
+	fakeFile, err := parser.ParseFile(token.NewFileSet(), "", fileSrc, parser.SkipObjectResolution)
 	if fakeFile == nil {
 		return nil, fmt.Errorf("error reading fake file source: %v", err)
 	}

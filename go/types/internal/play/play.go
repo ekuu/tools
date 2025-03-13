@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build go1.23
+
 // The play program is a playground for go/types: a simple web-based
 // text editor into which the user can enter a Go program, select a
 // region, and see type information about it.
@@ -28,15 +30,15 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/ast/inspector"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/types/typeutil"
-	"golang.org/x/tools/internal/aliases"
+	"golang.org/x/tools/internal/astutil/cursor"
 	"golang.org/x/tools/internal/typeparams"
 )
 
 // TODO(adonovan):
 // - show line numbers next to textarea.
-// - show a (tree) breakdown of the representation of the expression's type.
 // - mention this in the go/types tutorial.
 // - display versions of go/types and go command.
 
@@ -114,7 +116,7 @@ func handleSelectJSON(w http.ResponseWriter, req *http.Request) {
 
 	fset := pkg.Fset
 	file := pkg.Syntax[0]
-	tokFile := fset.File(file.Pos())
+	tokFile := fset.File(file.FileStart)
 	startPos := tokFile.Pos(startOffset)
 	endPos := tokFile.Pos(endOffset)
 
@@ -161,6 +163,15 @@ func handleSelectJSON(w http.ResponseWriter, req *http.Request) {
 			innermostExpr = e
 		}
 	}
+	// Show the cursor stack too.
+	// It's usually the same, but may differ in edge
+	// cases (e.g. around FuncType.Func).
+	inspect := inspector.New([]*ast.File{file})
+	if cur, ok := cursor.Root(inspect).FindPos(startPos, endPos); ok {
+		fmt.Fprintf(out, "Cursor.FindPos().Stack() = %v\n", cur.Stack(nil))
+	} else {
+		fmt.Fprintf(out, "Cursor.FindPos() failed\n")
+	}
 	fmt.Fprintf(out, "\n")
 
 	// Expression type information
@@ -195,8 +206,10 @@ func handleSelectJSON(w http.ResponseWriter, req *http.Request) {
 			if tv.Value != nil {
 				fmt.Fprintf(out, ", and constant value %v", tv.Value)
 			}
-			fmt.Fprintf(out, "\n\n")
+		} else {
+			fmt.Fprintf(out, "%T has no type", innermostExpr)
 		}
+		fmt.Fprintf(out, "\n\n")
 	}
 
 	// selection x.f information (if cursor is over .f)
@@ -284,7 +297,7 @@ func formatObj(out *strings.Builder, fset *token.FileSet, ref string, obj types.
 		if obj.IsAlias() {
 			kind = "type alias"
 		}
-		if named, ok := aliases.Unalias(obj.Type()).(*types.Named); ok {
+		if named, ok := types.Unalias(obj.Type()).(*types.Named); ok {
 			origin = named.Obj()
 		}
 	}
@@ -295,6 +308,10 @@ func formatObj(out *strings.Builder, fset *token.FileSet, ref string, obj types.
 		fmt.Fprintf(out, " (instantiation of %v)", origin.Type())
 	}
 	fmt.Fprintf(out, "\n\n")
+
+	fmt.Fprintf(out, "Type:\n")
+	describeType(out, obj.Type())
+	fmt.Fprintf(out, "\n")
 
 	// method set
 	if methods := typeutil.IntuitiveMethodSet(obj.Type(), nil); len(methods) > 0 {
@@ -315,6 +332,65 @@ func formatObj(out *strings.Builder, fset *token.FileSet, ref string, obj types.
 		fmt.Fprintf(out, "%d:%d-%d:%d: %s\n",
 			start.Line, start.Column, end.Line, end.Column, scope)
 	}
+}
+
+// describeType formats t to out in a way that makes it clear what methods to call on t to
+// get at its parts.
+// describeType assumes t was constructed by the type checker, so it doesn't check
+// for recursion. The type checker replaces recursive alias types, which are illegal,
+// with a BasicType that says as much. Other types that it constructs are recursive
+// only via a name, and this function does not traverse names.
+func describeType(out *strings.Builder, t types.Type) {
+	depth := -1
+
+	var ft func(string, types.Type)
+	ft = func(prefix string, t types.Type) {
+		depth++
+		defer func() { depth-- }()
+
+		for range depth {
+			fmt.Fprint(out, ".  ")
+		}
+
+		fmt.Fprintf(out, "%s%T:", prefix, t)
+		switch t := t.(type) {
+		case *types.Basic:
+			fmt.Fprintf(out, " Name: %q\n", t.Name())
+		case *types.Pointer:
+			fmt.Fprintln(out)
+			ft("Elem: ", t.Elem())
+		case *types.Slice:
+			fmt.Fprintln(out)
+			ft("Elem: ", t.Elem())
+		case *types.Array:
+			fmt.Fprintf(out, " Len: %d\n", t.Len())
+			ft("Elem: ", t.Elem())
+		case *types.Map:
+			fmt.Fprintln(out)
+			ft("Key:  ", t.Key())
+			ft("Elem: ", t.Elem())
+		case *types.Chan:
+			fmt.Fprintf(out, " Dir: %s\n", chanDirs[t.Dir()])
+			ft("Elem: ", t.Elem())
+		case *types.Alias:
+			fmt.Fprintf(out, " Name: %q\n", t.Obj().Name())
+			ft("Rhs: ", t.Rhs())
+		default:
+			// For types we may have missed or which have too much to bother with,
+			// print their string representation.
+			// TODO(jba): print more about struct types (their fields) and interface and named
+			// types (their methods).
+			fmt.Fprintf(out, " %s\n", t)
+		}
+	}
+
+	ft("", t)
+}
+
+var chanDirs = []string{
+	"SendRecv",
+	"SendOnly",
+	"RecvOnly",
 }
 
 func handleRoot(w http.ResponseWriter, req *http.Request) { io.WriteString(w, mainHTML) }
@@ -365,12 +441,3 @@ textarea { width: 6in; }
 body { color: gray; }
 div#out { font-family: monospace; font-size: 80%; }
 `
-
-// TODO(adonovan): use go1.21 built-in.
-func min(x, y int) int {
-	if x < y {
-		return x
-	} else {
-		return y
-	}
-}

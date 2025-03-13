@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"golang.org/x/tools/gopls/internal/protocol"
@@ -34,6 +35,10 @@ type Env struct {
 	Awaiter *Awaiter
 }
 
+// nextAwaiterRegistration is used to create unique IDs for various Awaiter
+// registrations.
+var nextAwaiterRegistration atomic.Uint64
+
 // An Awaiter keeps track of relevant LSP state, so that it may be asserted
 // upon with Expectations.
 //
@@ -46,9 +51,13 @@ type Awaiter struct {
 
 	mu sync.Mutex
 	// For simplicity, each waiter gets a unique ID.
-	nextWaiterID int
-	state        State
-	waiters      map[int]*condition
+	state   State
+	waiters map[uint64]*condition
+
+	// collectors map a registration to the collection of messages that have been
+	// received since the registration was created.
+	docCollectors     map[uint64][]*protocol.ShowDocumentParams
+	messageCollectors map[uint64][]*protocol.ShowMessageParams
 }
 
 func NewAwaiter(workdir *fake.Workdir) *Awaiter {
@@ -60,7 +69,7 @@ func NewAwaiter(workdir *fake.Workdir) *Awaiter {
 			startedWork:   make(map[string]uint64),
 			completedWork: make(map[string]uint64),
 		},
-		waiters: make(map[int]*condition),
+		waiters: make(map[uint64]*condition),
 	}
 }
 
@@ -78,9 +87,6 @@ func (a *Awaiter) Hooks() fake.ClientHooks {
 		OnUnregisterCapability:   a.onUnregisterCapability,
 	}
 }
-
-// ResetShownDocuments resets the set of accumulated ShownDocuments seen so far.
-func (a *Awaiter) ResetShownDocuments() { a.state.showDocument = nil }
 
 // State encapsulates the server state TODO: explain more
 type State struct {
@@ -108,53 +114,16 @@ type workProgress struct {
 	complete           bool // seen 'end'
 }
 
-// This method, provided for debugging, accesses mutable fields without a lock,
-// so it must not be called concurrent with any State mutation.
-func (s State) String() string {
-	var b strings.Builder
-	b.WriteString("#### log messages (see RPC logs for full text):\n")
-	for _, msg := range s.logs {
-		summary := fmt.Sprintf("%v: %q", msg.Type, msg.Message)
-		if len(summary) > 60 {
-			summary = summary[:57] + "..."
-		}
-		// Some logs are quite long, and since they should be reproduced in the RPC
-		// logs on any failure we include here just a short summary.
-		fmt.Fprint(&b, "\t"+summary+"\n")
-	}
-	b.WriteString("\n")
-	b.WriteString("#### diagnostics:\n")
-	for name, params := range s.diagnostics {
-		fmt.Fprintf(&b, "\t%s (version %d):\n", name, params.Version)
-		for _, d := range params.Diagnostics {
-			fmt.Fprintf(&b, "\t\t%d:%d [%s]: %s\n", d.Range.Start.Line, d.Range.Start.Character, d.Source, d.Message)
-		}
-	}
-	b.WriteString("\n")
-	b.WriteString("#### outstanding work:\n")
-	for token, state := range s.work {
-		if state.complete {
-			continue
-		}
-		name := state.title
-		if name == "" {
-			name = fmt.Sprintf("!NO NAME(token: %s)", token)
-		}
-		fmt.Fprintf(&b, "\t%s: %.2f\n", name, state.percent)
-	}
-	b.WriteString("#### completed work:\n")
-	for name, count := range s.completedWork {
-		fmt.Fprintf(&b, "\t%s: %d\n", name, count)
-	}
-	return b.String()
+type awaitResult struct {
+	verdict Verdict
+	reason  string
 }
 
-// A condition is satisfied when all expectations are simultaneously
-// met. At that point, the 'met' channel is closed. On any failure, err is set
-// and the failed channel is closed.
+// A condition is satisfied when its expectation is [Met] or [Unmeetable]. The
+// result is sent on the verdict channel.
 type condition struct {
-	expectations []Expectation
-	verdict      chan Verdict
+	expectation Expectation
+	verdict     chan awaitResult
 }
 
 func (a *Awaiter) onDiagnostics(_ context.Context, d *protocol.PublishDiagnosticsParams) error {
@@ -171,18 +140,76 @@ func (a *Awaiter) onShowDocument(_ context.Context, params *protocol.ShowDocumen
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	// Update any outstanding listeners.
+	for id, s := range a.docCollectors {
+		a.docCollectors[id] = append(s, params)
+	}
+
 	a.state.showDocument = append(a.state.showDocument, params)
 	a.checkConditionsLocked()
 	return nil
 }
 
-func (a *Awaiter) onShowMessage(_ context.Context, m *protocol.ShowMessageParams) error {
+// ListenToShownDocuments registers a listener to incoming showDocument
+// notifications. Call the resulting func to deregister the listener and
+// receive all notifications that have occurred since the listener was
+// registered.
+func (a *Awaiter) ListenToShownDocuments() func() []*protocol.ShowDocumentParams {
+	id := nextAwaiterRegistration.Add(1)
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.state.showMessage = append(a.state.showMessage, m)
+	if a.docCollectors == nil {
+		a.docCollectors = make(map[uint64][]*protocol.ShowDocumentParams)
+	}
+	a.docCollectors[id] = nil
+
+	return func() []*protocol.ShowDocumentParams {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		params := a.docCollectors[id]
+		delete(a.docCollectors, id)
+		return params
+	}
+}
+
+func (a *Awaiter) onShowMessage(_ context.Context, params *protocol.ShowMessageParams) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// Update any outstanding listeners.
+	for id, s := range a.messageCollectors {
+		a.messageCollectors[id] = append(s, params)
+	}
+
+	a.state.showMessage = append(a.state.showMessage, params)
 	a.checkConditionsLocked()
 	return nil
+}
+
+// ListenToShownMessages registers a listener to incoming showMessage
+// notifications. Call the resulting func to deregister the listener and
+// receive all notifications that have occurred since the listener was
+// registered.
+func (a *Awaiter) ListenToShownMessages() func() []*protocol.ShowMessageParams {
+	id := nextAwaiterRegistration.Add(1)
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.messageCollectors == nil {
+		a.messageCollectors = make(map[uint64][]*protocol.ShowMessageParams)
+	}
+	a.messageCollectors[id] = nil
+
+	return func() []*protocol.ShowMessageParams {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		params := a.messageCollectors[id]
+		delete(a.messageCollectors, id)
+		return params
+	}
 }
 
 func (a *Awaiter) onShowMessageRequest(_ context.Context, m *protocol.ShowMessageRequestParams) error {
@@ -218,7 +245,7 @@ func (a *Awaiter) onProgress(_ context.Context, m *protocol.ProgressParams) erro
 	if !ok {
 		panic(fmt.Sprintf("got progress report for unknown report %v: %v", m.Token, m))
 	}
-	v := m.Value.(map[string]interface{})
+	v := m.Value.(map[string]any)
 	switch kind := v["kind"]; kind {
 	case "begin":
 		work.title = v["title"].(string)
@@ -270,25 +297,11 @@ func (a *Awaiter) onUnregisterCapability(_ context.Context, m *protocol.Unregist
 
 func (a *Awaiter) checkConditionsLocked() {
 	for id, condition := range a.waiters {
-		if v, _ := checkExpectations(a.state, condition.expectations); v != Unmet {
+		if v, why := condition.expectation.Check(a.state); v != Unmet {
 			delete(a.waiters, id)
-			condition.verdict <- v
+			condition.verdict <- awaitResult{v, why}
 		}
 	}
-}
-
-// checkExpectations reports whether s meets all expectations.
-func checkExpectations(s State, expectations []Expectation) (Verdict, string) {
-	finalVerdict := Met
-	var summary strings.Builder
-	for _, e := range expectations {
-		v := e.Check(s)
-		if v > finalVerdict {
-			finalVerdict = v
-		}
-		fmt.Fprintf(&summary, "%v: %s\n", v, e.Description)
-	}
-	return finalVerdict, summary.String()
 }
 
 // Await blocks until the given expectations are all simultaneously met.
@@ -299,7 +312,7 @@ func checkExpectations(s State, expectations []Expectation) (Verdict, string) {
 // waiting.
 func (e *Env) Await(expectations ...Expectation) {
 	e.T.Helper()
-	if err := e.Awaiter.Await(e.Ctx, expectations...); err != nil {
+	if err := e.Awaiter.Await(e.Ctx, AllOf(expectations...)); err != nil {
 		e.T.Fatal(err)
 	}
 }
@@ -307,52 +320,49 @@ func (e *Env) Await(expectations ...Expectation) {
 // OnceMet blocks until the precondition is met by the state or becomes
 // unmeetable. If it was met, OnceMet checks that the state meets all
 // expectations in mustMeets.
-func (e *Env) OnceMet(precondition Expectation, mustMeets ...Expectation) {
+func (e *Env) OnceMet(pre Expectation, mustMeets ...Expectation) {
 	e.T.Helper()
-	e.Await(OnceMet(precondition, mustMeets...))
+	e.Await(OnceMet(pre, AllOf(mustMeets...)))
 }
 
 // Await waits for all expectations to simultaneously be met. It should only be
 // called from the main test goroutine.
-func (a *Awaiter) Await(ctx context.Context, expectations ...Expectation) error {
+func (a *Awaiter) Await(ctx context.Context, expectation Expectation) error {
 	a.mu.Lock()
 	// Before adding the waiter, we check if the condition is currently met or
 	// failed to avoid a race where the condition was realized before Await was
 	// called.
-	switch verdict, summary := checkExpectations(a.state, expectations); verdict {
+	switch verdict, why := expectation.Check(a.state); verdict {
 	case Met:
 		a.mu.Unlock()
 		return nil
 	case Unmeetable:
-		err := fmt.Errorf("unmeetable expectations:\n%s\nstate:\n%v", summary, a.state)
+		err := fmt.Errorf("unmeetable expectation:\n%s\nreason:\n%s", indent(expectation.Description), indent(why))
 		a.mu.Unlock()
 		return err
 	}
 	cond := &condition{
-		expectations: expectations,
-		verdict:      make(chan Verdict),
+		expectation: expectation,
+		verdict:     make(chan awaitResult),
 	}
-	a.waiters[a.nextWaiterID] = cond
-	a.nextWaiterID++
+	a.waiters[nextAwaiterRegistration.Add(1)] = cond
 	a.mu.Unlock()
 
 	var err error
 	select {
 	case <-ctx.Done():
 		err = ctx.Err()
-	case v := <-cond.verdict:
-		if v != Met {
-			err = fmt.Errorf("condition has final verdict %v", v)
+	case res := <-cond.verdict:
+		if res.verdict != Met {
+			err = fmt.Errorf("the following condition is %s:\n%s\nreason:\n%s",
+				res.verdict, indent(expectation.Description), indent(res.reason))
 		}
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	_, summary := checkExpectations(a.state, expectations)
+	return err
+}
 
-	// Debugging an unmet expectation can be tricky, so we put some effort into
-	// nicely formatting the failure.
-	if err != nil {
-		return fmt.Errorf("waiting on:\n%s\nerr:%v\n\nstate:\n%v", summary, err, a.state)
-	}
-	return nil
+// indent indents all lines of msg, including the first.
+func indent(msg string) string {
+	const prefix = "  "
+	return prefix + strings.ReplaceAll(msg, "\n", "\n"+prefix)
 }

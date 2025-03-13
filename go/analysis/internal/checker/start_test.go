@@ -22,6 +22,7 @@ import (
 // of the file takes effect.
 func TestStartFixes(t *testing.T) {
 	testenv.NeedsGoPackages(t)
+	testenv.RedirectStderr(t) // associated checker.Run output with this test
 
 	files := map[string]string{
 		"comment/doc.go": `/* Package comment */
@@ -39,6 +40,7 @@ package comment
 	path := filepath.Join(testdata, "src/comment/doc.go")
 	checker.Fix = true
 	checker.Run([]string{"file=" + path}, []*analysis.Analyzer{commentAnalyzer})
+	checker.Fix = false
 
 	contents, err := os.ReadFile(path)
 	if err != nil {
@@ -55,11 +57,12 @@ package comment
 
 var commentAnalyzer = &analysis.Analyzer{
 	Name:     "comment",
+	Doc:      "comment",
 	Requires: []*analysis.Analyzer{inspect.Analyzer},
 	Run:      commentRun,
 }
 
-func commentRun(pass *analysis.Pass) (interface{}, error) {
+func commentRun(pass *analysis.Pass) (any, error) {
 	const (
 		from = "/* Package comment */"
 		to   = "// Package comment"

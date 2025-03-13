@@ -126,7 +126,7 @@ var _ = unsafe.Slice(nil, 0)
 
 	Run(t, files, func(t *testing.T, env *Env) {
 		env.OpenFile("a.go")
-		for _, name := range strings.Fields(
+		for name := range strings.FieldsSeq(
 			"iota error int nil append iota Pointer Sizeof Alignof Add Slice") {
 			loc := env.RegexpSearch("a.go", `\b`+name+`\b`)
 
@@ -376,10 +376,6 @@ module example.com/a
 go 1.14
 require other.com/b v1.0.0
 
--- go.sum --
-other.com/b v1.0.0 h1:9WyCKS+BLAMRQM0CegP6zqP2beP+ShTbPaARpNY31II=
-other.com/b v1.0.0/go.mod h1:TgHQFucl04oGT+vrUm/liAzukYHNxCwKNkQZEyn3m9g=
-
 -- a.go --
 package a
 import "other.com/b"
@@ -388,6 +384,7 @@ var _ b.B
 
 `
 	WithOptions(
+		WriteGoSum("."),
 		ProxyFiles(proxy),
 		Modes(Default), // fails in 'experimental' mode
 	).Run(t, src, func(t *testing.T, env *Env) {

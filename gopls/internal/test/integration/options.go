@@ -7,6 +7,7 @@ package integration
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
@@ -24,7 +25,7 @@ type runConfig struct {
 func defaultConfig() runConfig {
 	return runConfig{
 		editor: fake.EditorConfig{
-			Settings: map[string]interface{}{
+			Settings: map[string]any{
 				// Shorten the diagnostic delay to speed up test execution (else we'd add
 				// the default delay to each assertion about diagnostics)
 				"diagnosticsDelay": "10ms",
@@ -108,11 +109,11 @@ func CapabilitiesJSON(capabilities []byte) RunOption {
 //
 // As a special case, the env setting must not be provided via Settings: use
 // EnvVars instead.
-type Settings map[string]interface{}
+type Settings map[string]any
 
 func (s Settings) set(opts *runConfig) {
 	if opts.editor.Settings == nil {
-		opts.editor.Settings = make(map[string]interface{})
+		opts.editor.Settings = make(map[string]any)
 	}
 	for k, v := range s {
 		opts.editor.Settings[k] = v
@@ -190,5 +191,16 @@ func InGOPATH() RunOption {
 func MessageResponder(f func(*protocol.ShowMessageRequestParams) (*protocol.MessageActionItem, error)) RunOption {
 	return optionSetter(func(opts *runConfig) {
 		opts.editor.MessageResponder = f
+	})
+}
+
+// DelayMessages can be used to fuzz message delivery delays for the purpose of
+// reproducing test flakes.
+//
+// (Even though this option may be unused, keep it around to aid in debugging
+// future flakes.)
+func DelayMessages(upto time.Duration) RunOption {
+	return optionSetter(func(opts *runConfig) {
+		opts.editor.MaxMessageDelay = upto
 	})
 }

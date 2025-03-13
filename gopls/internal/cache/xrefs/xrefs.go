@@ -17,8 +17,8 @@ import (
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/protocol"
+	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/frob"
-	"golang.org/x/tools/gopls/internal/util/typesutil"
 )
 
 // Index constructs a serializable index of outbound cross-references
@@ -44,17 +44,8 @@ func Index(files []*parsego.File, pkg *types.Package, info *types.Info) []byte {
 	objectpathFor := new(objectpath.Encoder).For
 
 	for fileIndex, pgf := range files {
-
-		nodeRange := func(n ast.Node) protocol.Range {
-			rng, err := pgf.PosRange(n.Pos(), n.End())
-			if err != nil {
-				panic(err) // can't fail
-			}
-			return rng
-		}
-
-		ast.Inspect(pgf.File, func(n ast.Node) bool {
-			switch n := n.(type) {
+		for cur := range pgf.Cursor.Preorder((*ast.Ident)(nil), (*ast.ImportSpec)(nil)) {
+			switch n := cur.Node().(type) {
 			case *ast.Ident:
 				// Report a reference for each identifier that
 				// uses a symbol exported from another package.
@@ -77,25 +68,30 @@ func Index(files []*parsego.File, pkg *types.Package, info *types.Info) []byte {
 							if err != nil {
 								// Capitalized but not exported
 								// (e.g. local const/var/type).
-								return true
+								continue
 							}
 							gobObj = &gobObject{Path: path}
 							objects[obj] = gobObj
 						}
 
-						gobObj.Refs = append(gobObj.Refs, gobRef{
-							FileIndex: fileIndex,
-							Range:     nodeRange(n),
-						})
+						// golang/go#66683: nodes can under/overflow the file.
+						// For example, "var _ = x." creates a SelectorExpr(Sel=Ident("_"))
+						// that is beyond EOF. (Arguably Ident.Name should be "".)
+						if rng, err := pgf.NodeRange(n); err == nil {
+							gobObj.Refs = append(gobObj.Refs, gobRef{
+								FileIndex: fileIndex,
+								Range:     rng,
+							})
+						}
 					}
 				}
 
 			case *ast.ImportSpec:
 				// Report a reference from each import path
 				// string to the imported package.
-				pkgname, ok := typesutil.ImportedPkgName(info, n)
-				if !ok {
-					return true // missing import
+				pkgname := info.PkgNameOf(n)
+				if pkgname == nil {
+					continue // missing import
 				}
 				objects := getObjects(pkgname.Imported())
 				gobObj, ok := objects[nil]
@@ -103,13 +99,17 @@ func Index(files []*parsego.File, pkg *types.Package, info *types.Info) []byte {
 					gobObj = &gobObject{Path: ""}
 					objects[nil] = gobObj
 				}
-				gobObj.Refs = append(gobObj.Refs, gobRef{
-					FileIndex: fileIndex,
-					Range:     nodeRange(n.Path),
-				})
+				// golang/go#66683: nodes can under/overflow the file.
+				if rng, err := pgf.NodeRange(n.Path); err == nil {
+					gobObj.Refs = append(gobObj.Refs, gobRef{
+						FileIndex: fileIndex,
+						Range:     rng,
+					})
+				} else {
+					bug.Reportf("out of bounds import spec %+v", n.Path)
+				}
 			}
-			return true
-		})
+		}
 	}
 
 	// Flatten the maps into slices, and sort for determinism.

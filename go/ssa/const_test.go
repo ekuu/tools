@@ -39,9 +39,9 @@ func TestConstString(t *testing.T) {
 	}
 
 	for _, test := range []struct {
-		expr     string      // type expression
-		constant interface{} // constant value
-		want     string      // expected String() value
+		expr     string // type expression
+		constant any    // constant value
+		want     string // expected String() value
 	}{
 		{"int", int64(0), "0:int"},
 		{"int64", int64(0), "0:int64"},
@@ -58,10 +58,10 @@ func TestConstString(t *testing.T) {
 		{"interface{string}", nil, `"":interface{string}`},
 		{"interface{int|int64}", nil, "0:interface{int|int64}"},
 		{"interface{bool}", nil, "false:interface{bool}"},
-		{"interface{bool|int}", nil, "nil:interface{bool|int}"},
-		{"interface{int|string}", nil, "nil:interface{int|string}"},
-		{"interface{bool|string}", nil, "nil:interface{bool|string}"},
-		{"interface{struct{x string}}", nil, "nil:interface{struct{x string}}"},
+		{"interface{bool|int}", nil, "invalid:interface{bool|int}"},
+		{"interface{int|string}", nil, "invalid:interface{int|string}"},
+		{"interface{bool|string}", nil, "invalid:interface{bool|string}"},
+		{"interface{struct{x string}}", nil, "invalid:interface{struct{x string}}"},
 		{"interface{int|int64}", int64(1), "1:interface{int|int64}"},
 		{"interface{~bool}", true, "true:interface{~bool}"},
 		{"interface{Named}", "lorem ipsum", `"lorem ipsum":interface{P.Named}`},

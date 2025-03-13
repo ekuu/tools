@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -19,7 +18,6 @@ import (
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/protocol/command"
 	"golang.org/x/tools/internal/event"
-	"golang.org/x/tools/internal/gocommand"
 	"golang.org/x/tools/internal/memoize"
 )
 
@@ -47,14 +45,14 @@ func (s *Snapshot) ParseMod(ctx context.Context, fh file.Handle) (*ParsedModule,
 
 	// cache miss?
 	if !hit {
-		promise, release := s.store.Promise(parseModKey(fh.Identity()), func(ctx context.Context, _ interface{}) interface{} {
+		promise, release := s.store.Promise(parseModKey(fh.Identity()), func(ctx context.Context, _ any) any {
 			parsed, err := parseModImpl(ctx, fh)
 			return parseModResult{parsed, err}
 		})
 
 		entry = promise
 		s.mu.Lock()
-		s.parseModHandles.Set(uri, entry, func(_, _ interface{}) { release() })
+		s.parseModHandles.Set(uri, entry, func(_, _ any) { release() })
 		s.mu.Unlock()
 	}
 
@@ -133,14 +131,14 @@ func (s *Snapshot) ParseWork(ctx context.Context, fh file.Handle) (*ParsedWorkFi
 
 	// cache miss?
 	if !hit {
-		handle, release := s.store.Promise(parseWorkKey(fh.Identity()), func(ctx context.Context, _ interface{}) interface{} {
+		handle, release := s.store.Promise(parseWorkKey(fh.Identity()), func(ctx context.Context, _ any) any {
 			parsed, err := parseWorkImpl(ctx, fh)
 			return parseWorkResult{parsed, err}
 		})
 
 		entry = handle
 		s.mu.Lock()
-		s.parseWorkHandles.Set(uri, entry, func(_, _ interface{}) { release() })
+		s.parseWorkHandles.Set(uri, entry, func(_, _ any) { release() })
 		s.mu.Unlock()
 	}
 
@@ -214,7 +212,7 @@ func (s *Snapshot) ModWhy(ctx context.Context, fh file.Handle) (map[string]strin
 
 	// cache miss?
 	if !hit {
-		handle := memoize.NewPromise("modWhy", func(ctx context.Context, arg interface{}) interface{} {
+		handle := memoize.NewPromise("modWhy", func(ctx context.Context, arg any) any {
 			why, err := modWhyImpl(ctx, arg.(*Snapshot), fh)
 			return modWhyResult{why, err}
 		})
@@ -252,11 +250,7 @@ func modWhyImpl(ctx context.Context, snapshot *Snapshot, fh file.Handle) (map[st
 	for _, req := range pm.File.Require {
 		args = append(args, req.Mod.Path)
 	}
-	inv, cleanupInvocation, err := snapshot.GoCommandInvocation(false, &gocommand.Invocation{
-		Verb:       "mod",
-		Args:       args,
-		WorkingDir: filepath.Dir(fh.URI().Path()),
-	})
+	inv, cleanupInvocation, err := snapshot.GoCommandInvocation(NoNetwork, fh.URI().DirPath(), "mod", args)
 	if err != nil {
 		return nil, err
 	}
@@ -418,10 +412,7 @@ func (s *Snapshot) goCommandDiagnostic(pm *ParsedModule, loc protocol.Location, 
 
 	switch {
 	case strings.Contains(goCmdError, "inconsistent vendoring"):
-		cmd, err := command.NewVendorCommand("Run go mod vendor", command.URIArg{URI: pm.URI})
-		if err != nil {
-			return nil, err
-		}
+		cmd := command.NewVendorCommand("Run go mod vendor", command.URIArg{URI: pm.URI})
 		return &Diagnostic{
 			URI:      pm.URI,
 			Range:    loc.Range,
@@ -435,14 +426,8 @@ See https://github.com/golang/go/issues/39164 for more detail on this issue.`,
 	case strings.Contains(goCmdError, "updates to go.sum needed"), strings.Contains(goCmdError, "missing go.sum entry"):
 		var args []protocol.DocumentURI
 		args = append(args, s.View().ModFiles()...)
-		tidyCmd, err := command.NewTidyCommand("Run go mod tidy", command.URIArgs{URIs: args})
-		if err != nil {
-			return nil, err
-		}
-		updateCmd, err := command.NewUpdateGoSumCommand("Update go.sum", command.URIArgs{URIs: args})
-		if err != nil {
-			return nil, err
-		}
+		tidyCmd := command.NewTidyCommand("Run go mod tidy", command.URIArgs{URIs: args})
+		updateCmd := command.NewUpdateGoSumCommand("Update go.sum", command.URIArgs{URIs: args})
 		msg := "go.sum is out of sync with go.mod. Please update it by applying the quick fix."
 		if innermost != nil {
 			msg = fmt.Sprintf("go.sum is out of sync with go.mod: entry for %v is missing. Please updating it by applying the quick fix.", innermost)
@@ -460,14 +445,11 @@ See https://github.com/golang/go/issues/39164 for more detail on this issue.`,
 		}, nil
 	case strings.Contains(goCmdError, "disabled by GOPROXY=off") && innermost != nil:
 		title := fmt.Sprintf("Download %v@%v", innermost.Path, innermost.Version)
-		cmd, err := command.NewAddDependencyCommand(title, command.DependencyArgs{
+		cmd := command.NewAddDependencyCommand(title, command.DependencyArgs{
 			URI:        pm.URI,
 			AddRequire: false,
 			GoCmdArgs:  []string{fmt.Sprintf("%v@%v", innermost.Path, innermost.Version)},
 		})
-		if err != nil {
-			return nil, err
-		}
 		return &Diagnostic{
 			URI:            pm.URI,
 			Range:          loc.Range,

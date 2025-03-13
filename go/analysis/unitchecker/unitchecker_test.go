@@ -17,7 +17,7 @@ import (
 	"golang.org/x/tools/go/analysis/passes/findcall"
 	"golang.org/x/tools/go/analysis/passes/printf"
 	"golang.org/x/tools/go/analysis/unitchecker"
-	"golang.org/x/tools/go/packages/packagestest"
+	"golang.org/x/tools/internal/packagestest"
 )
 
 func TestMain(m *testing.M) {
@@ -59,7 +59,7 @@ func testIntegration(t *testing.T, exporter packagestest.Exporter) {
 
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a
 
 func _() {
@@ -133,7 +133,7 @@ func _() {
 				"message": "self-assignment of i to i",
 				"suggested_fixes": \[
 					\{
-						"message": "Remove",
+						"message": "Remove self-assignment",
 						"edits": \[
 							\{
 								"filename": "([/._\-a-zA-Z0-9]+[\\/]fake[\\/])?c/c.go",

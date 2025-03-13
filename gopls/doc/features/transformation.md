@@ -6,6 +6,7 @@ formatting, simplifications), code repair (fixes), and editing support
 (filling in struct literals and switch statements).
 
 Code transformations are not a single category in the LSP:
+
 - A few, such as Formatting and Rename, are primary operations in the
   protocol.
 - Some transformations are exposed through [Code Lenses](../codelenses.md),
@@ -43,6 +44,7 @@ or to cause the server to send other requests to the client,
 such as a `showDocument` request to open a report in a web browser.
 
 The main difference between code lenses and code actions is this:
+
 - a `codeLens` request obtains commands for the entire file.
   Each command specifies its applicable source range,
   and typically appears as an annotation on that source range.
@@ -50,14 +52,42 @@ The main difference between code lenses and code actions is this:
   All the commands are presented together in a menu at that location.
 
 Each action has a _kind_,
-which is a hierarchical identifier such as `refactor.inline`.
+which is a hierarchical identifier such as `refactor.inline.call`.
 Clients may filter actions based on their kind.
 For example, VS Code has:
 two menus, "Refactor..." and "Source action...", each populated by
-different kinds of code actions (`refactor.*` and `source.*`);
-a lightbulb icon that triggers a menu of "quick fixes" (of kind `quickfix.*`);
+different kinds of code actions (`refactor` and `source`);
+a lightbulb icon that triggers a menu of "quick fixes" (of kind `quickfix`);
 and a "Fix All" command that executes all code actions of
 kind `source.fixAll`, which are those deemed unambiguously safe to apply.
+
+Gopls supports the following code actions:
+
+- `quickfix`, which applies unambiguously safe fixes <!-- TODO: document -->
+- [`source.organizeImports`](#source.organizeImports)
+- [`source.assembly`](web.md#assembly)
+- [`source.doc`](web.md#doc)
+- [`source.freesymbols`](web.md#freesymbols)
+- `source.test` (undocumented) <!-- TODO: fix that -->
+- [`source.addTest`](#source.addTest)
+- [`source.toggleCompilerOptDetails`](diagnostics.md#toggleCompilerOptDetails)
+- [`gopls.doc.features`](README.md), which opens gopls' index of features in a browser
+- [`refactor.extract.constant`](#extract)
+- [`refactor.extract.function`](#extract)
+- [`refactor.extract.method`](#extract)
+- [`refactor.extract.toNewFile`](#extract.toNewFile)
+- [`refactor.extract.variable`](#extract)
+- [`refactor.extract.variable-all`](#extract)
+- [`refactor.inline.call`](#refactor.inline.call)
+- [`refactor.rewrite.changeQuote`](#refactor.rewrite.changeQuote)
+- [`refactor.rewrite.fillStruct`](#refactor.rewrite.fillStruct)
+- [`refactor.rewrite.fillSwitch`](#refactor.rewrite.fillSwitch)
+- [`refactor.rewrite.invertIf`](#refactor.rewrite.invertIf)
+- [`refactor.rewrite.joinLines`](#refactor.rewrite.joinLines)
+- [`refactor.rewrite.removeUnusedParam`](#refactor.rewrite.removeUnusedParam)
+- [`refactor.rewrite.splitLines`](#refactor.rewrite.splitLines)
+- [`refactor.rewrite.moveParamLeft`](#refactor.rewrite.moveParamLeft)
+- [`refactor.rewrite.moveParamRight`](#refactor.rewrite.moveParamRight)
 
 Gopls reports some code actions twice, with two different kinds, so
 that they appear in multiple UI elements: simplifications,
@@ -75,12 +105,26 @@ that, in the course of reporting a diagnostic about a problem,
 also suggest a fix.
 A `codeActions` request will return any fixes accompanying diagnostics
 for the current selection.
+
 <!-- Some gopls-internal analyzers compute fixes lazily by
      reporting an empty list of TextEdits and a Diagnostic.Category
      recognized by gopls that enables corresponding logic in the
      server's ApplyFix command handler. -->
 
+<!-- The source.test ("Run this test") code action (not a
+     transformation) runs the selected test. However, it is not
+     offered by default because:
+     (a) VS Code has a richer test UX (with richer ones to come--see
+         https://github.com/golang/vscode-go/issues/1641) and
+     (b) LSP has no good way to display the streaming output of a test
+         in the client's natural UX (see last paragraph of first note
+	 of https://github.com/golang/go/issues/67400).
+     It is only offered when the "only" field includes kind source.test.
+     Should it be documented? If so, where?
+-->
+
 Caveats:
+
 - Many of gopls code transformations are limited by Go's syntax tree
   representation, which currently records comments not in the tree
   but in a side table; consequently, transformations such as Extract
@@ -108,6 +152,7 @@ Client support for code actions:
 - **CLI**: `gopls codeaction -exec -kind k,... -diff file.go:#123-#456` executes code actions of the specified
   kinds (e.g. `refactor.inline`) on the selected range, specified using zero-based byte offsets, and displays the diff.
 
+<a name='formatting'></a>
 ## Formatting
 
 The LSP
@@ -121,15 +166,18 @@ Most clients are configured to format files and organize imports
 whenever a file is saved.
 
 Settings:
+
 - The [`gofumpt`](../settings.md#gofumpt) setting causes gopls to use an
   alternative formatter, [`github.com/mvdan/gofumpt`](https://pkg.go.dev/mvdan.cc/gofumpt).
 
 Client support:
+
 - **VS Code**: Formats on save by default. Use `Format document` menu item (`⌥⇧F`) to invoke manually.
 - **Emacs + eglot**: Use `M-x eglot-format-buffer` to format. Attach it to `before-save-hook` to format on save. For formatting combined with organize-imports, many users take the legacy approach of setting `"goimports"` as their `gofmt-command` using [go-mode](https://github.com/dominikh/go-mode.el), and adding `gofmt-before-save` to `before-save-hook`. An LSP-based solution requires code such as https://github.com/joaotavora/eglot/discussions/1409.
 - **CLI**: `gopls format file.go`
 
-## Organize imports
+<a name='source.organizeImports'></a>
+## `source.organizeImports`: Organize imports
 
 A `codeActions` request in a file whose imports are not organized will
 return an action of the standard kind `source.organizeImports`.
@@ -156,6 +204,7 @@ Settings:
   should appear after standard and third-party packages in the sort order.
 
 Client support:
+
 - **VS Code**: automatically invokes `source.organizeImports` before save.
   To disable it, use the snippet below, and invoke the "Organize Imports" command manually as needed.
   ```
@@ -174,7 +223,47 @@ Client support:
   ```
 - **CLI**: `gopls fix -a file.go:#offset source.organizeImports`
 
+<a name='source.addTest'></a>
+## `source.addTest`: Add test for function or method
 
+If the selected chunk of code is part of a function or method declaration F,
+gopls will offer the "Add test for F" code action, which adds a new test for the
+selected function in the corresponding `_test.go` file. The generated test takes
+into account its signature, including input parameters and results.
+
+**Test file**: if the `_test.go` file does not exist, gopls creates it, based on
+the name of the current file (`a.go` -> `a_test.go`), copying any copyright and
+build constraint comments from the original file.
+
+**Test package**: for new files that test code in package `p`, the test file
+uses `p_test` package name whenever possible, to encourage testing only exported
+functions. (If the test file already exists, the new test is added to that file.)
+
+**Parameters**: each of the function's non-blank parameters becomes an item in
+the struct used for the table-driven test. (For each blank `_` parameter, the
+value has no effect, so the test provides a zero-valued argument.)
+
+**Contexts**: If the first parameter is `context.Context`, the test passes
+`context.Background()`.
+
+**Results**: the function's results are assigned to variables (`got`, `got2`,
+and so on) and compared with expected values (`want`, `want2`, etc.`) defined in
+the test case struct. The user should edit the logic to perform the appropriate
+comparison. If the final result is an `error`, the test case defines a `wantErr`
+boolean.
+
+**Method receivers**: When testing a method `T.F` or `(*T).F`, the test must
+construct an instance of T to pass as the receiver. Gopls searches the package
+for a suitable function that constructs a value of type T or \*T, optionally with
+an error, preferring a function named `NewT`.
+
+**Imports**: Gopls adds missing imports to the test file, using the last
+corresponding import specifier from the original file. It avoids duplicate
+imports, preserving any existing imports in the test file.
+
+<img title="Add test for func" src="../assets/add-test-for-func.png" width='80%'>
+
+<a name='rename'></a>
 ## Rename
 
 The LSP
@@ -227,9 +316,10 @@ Similar problems may arise with packages that use reflection, such as
 judgment and testing.
 
 Some tips for best results:
+
 - There is currently no special support for renaming all receivers of
   a family of methods at once, so you will need to rename one receiver
-  one at a  time (golang/go#41892).
+  one at a time (golang/go#41892).
 - The safety checks performed by the Rename algorithm require type
   information. If the program is grossly malformed, there may be
   insufficient information for it to run (golang/go#41870),
@@ -250,23 +340,20 @@ in the latter half of this 2015 GothamGo talk:
 [Using go/types for Code Comprehension and Refactoring Tools](https://www.youtube.com/watch?v=p_cz7AxVdfg).
 
 Client support:
+
 - **VS Code**: Use "[Rename symbol](https://code.visualstudio.com/docs/editor/editingevolved#_rename-symbol)" menu item (`F2`).
 - **Emacs + eglot**: Use `M-x eglot-rename`, or `M-x go-rename` from [go-mode](https://github.com/dominikh/go-mode.el).
 - **Vim + coc.nvim**: Use the `coc-rename` command.
 - **CLI**: `gopls rename file.go:#offset newname`
 
-
-<a name='extract'></a>
-## Extract function/method/variable
+<a name='refactor.extract'></a>
+## `refactor.extract`: Extract function/method/variable
 
 The `refactor.extract` family of code actions all return commands that
 replace the selected expression or statements with a reference to a
 newly created declaration that contains the selected code:
 
-<!-- See TODO comments in settings/codeactionkind.go about splitting
-     up "refactor.extract" into finer grained categories. -->
-
-- **Extract function** replaces one or more complete statements by a
+- **`refactor.extract.function`** replaces one or more complete statements by a
   call to a new function named `newFunction` whose body contains the
   statements. The selection must enclose fewer statements than the
   entire body of the existing function.
@@ -274,16 +361,27 @@ newly created declaration that contains the selected code:
   ![Before extracting a function](../assets/extract-function-before.png)
   ![After extracting a function](../assets/extract-function-after.png)
 
-- **Extract method** is a variant of "Extract function" offered when
+- **`refactor.extract.method`** is a variant of "Extract function" offered when
   the selected statements belong to a method. The newly created function
   will be a method of the same receiver type.
 
-- **Extract variable** replaces an expression by a reference to a new
-  local variable named `x` initialized by the expression:
+- **`refactor.extract.variable`** replaces an expression by a reference to a new
+  local variable named `newVar` initialized by the expression:
 
   ![Before extracting a var](../assets/extract-var-before.png)
   ![After extracting a var](../assets/extract-var-after.png)
 
+- **`refactor.extract.constant** does the same thing for a constant
+  expression, introducing a local const declaration.
+- **`refactor.extract.variable-all`** replaces all occurrences of the selected expression
+within the function with a reference to a new local variable named `newVar`.
+This extracts the expression once and reuses it wherever it appears in the function.
+
+  ![Before extracting all occurrences of EXPR](../assets/extract-var-all-before.png)
+  ![After extracting all occurrences of EXPR](../assets/extract-var-all-after.png)
+
+  - **`refactor.extract.constant-all** does the same thing for a constant
+  expression, introducing a local const declaration.
 If the default name for the new declaration is already in use, gopls
 generates a fresh name.
 
@@ -299,26 +397,21 @@ number of cases where it falls short, including:
 
 - https://github.com/golang/go/issues/66289
 - https://github.com/golang/go/issues/65944
-- https://github.com/golang/go/issues/64821
 - https://github.com/golang/go/issues/63394
 - https://github.com/golang/go/issues/61496
-- https://github.com/golang/go/issues/50851
 
 The following Extract features are planned for 2024 but not yet supported:
 
-- **Extract constant** is a variant of "Extract variable" to be
-  offered when the expression is constant; see golang/go#37170.
 - **Extract parameter struct** will replace two or more parameters of a
   function by a struct type with one field per parameter; see golang/go#65552.
-  <!-- TODO(adonovan): review and land https://go.dev/cl/563235. -->
+  <!-- TODO(adonovan): review and land https://go.dev/cl/620995. -->
   <!-- Should this operation update all callers? That's more of a Change Signature. -->
 - **Extract interface for type** will create a declaration of an
   interface type with all the methods of the selected concrete type;
   see golang/go#65721 and golang/go#46665.
 
-
-<a name='extract-to-new-file'></a>
-## Extract declarations to new file
+<a name='refactor.extract.toNewFile'></a>
+## `refactor.extract.toNewFile`: Extract declarations to new file
 
 (Available from gopls/v0.17.0)
 
@@ -333,15 +426,16 @@ first token of the declaration, such as `func` or `type`.
 ![Before: select the declarations to move](../assets/extract-to-new-file-before.png)
 ![After: the new file is based on the first symbol name](../assets/extract-to-new-file-after.png)
 
+<a name='refactor.inline.call'></a>
 
-<a name='inline'></a>
-## Inline call to function
+## `refactor.inline.call`: Inline call to function
 
 For a `codeActions` request where the selection is (or is within) a
 call of a function or method, gopls will return a command of kind
-`refactor.inline`, whose effect is to inline the function call.
+`refactor.inline.call`, whose effect is to inline the function call.
 
 The screenshots below show a call to `sum` before and after inlining:
+
 <!-- source code used for images:
 
 func six() int {
@@ -356,6 +450,7 @@ func sum(values ...int) int {
 	return total
 }
 -->
+
 ![Before: select Refactor... Inline call to sum](../inline-before.png)
 ![After: the call has been replaced by the sum logic](../inline-after.png)
 
@@ -408,13 +503,16 @@ func f(s string) {
 	fmt.Println(s)
 }
 ```
+
 a call `f("hello")` will be inlined to:
+
 ```go
 	func() {
 		defer fmt.Println("goodbye")
 		fmt.Println("hello")
 	}()
 ```
+
 Although the parameter was eliminated, the function call remains.
 
 An inliner is a bit like an optimizing compiler.
@@ -463,18 +561,17 @@ Here are some of the technical challenges involved in sound inlining:
   `Printf` by qualified references such as `fmt.Printf`, and add an
   import of package `fmt` as needed.
 
-- **Implicit conversions:** When passing an argument to a function, it
-  is implicitly converted to the parameter type.
-  If we eliminate the parameter variable, we don't want to
-  lose the conversion as it may be important.
-  For example, in `func f(x any) { y := x; fmt.Printf("%T", &y) }` the
-  type of variable y is `any`, so the program prints `"*interface{}"`.
-  But if inlining the call `f(1)` were to produce the statement `y :=
-  1`, then the type of y would have changed to `int`, which could
-  cause a compile error or, as in this case, a bug, as the program
-  now prints `"*int"`. When the inliner substitutes a parameter variable
-  by its argument value, it may need to introduce explicit conversions
-  of each value to the original parameter type, such as `y := any(1)`.
+- **Implicit conversions:** When passing an argument to a function, it is
+  implicitly converted to the parameter type. If we eliminate the parameter
+  variable, we don't want to lose the conversion as it may be important. For
+  example, in `func f(x any) { y := x; fmt.Printf("%T", &y) }` the type of
+  variable y is `any`, so the program prints `"*interface{}"`. But if inlining
+  the call `f(1)` were to produce the statement `y := 1`, then the type of y
+  would have changed to `int`, which could cause a compile error or, as in this
+  case, a bug, as the program now prints `"*int"`. When the inliner substitutes
+  a parameter variable by its argument value, it may need to introduce explicit
+  conversions of each value to the original parameter type, such as `y :=
+  any(1)`.
 
 - **Last reference:** When an argument expression has no effects
   and its corresponding parameter is never used, the expression
@@ -489,19 +586,19 @@ more detail. All of this is to say, it's a complex problem, and we aim
 for correctness first of all. We've already implemented a number of
 important "tidiness optimizations" and we expect more to follow.
 
-## Miscellaneous rewrites
+<a name='refactor.rewrite'></a>
+## `refactor.rewrite`: Miscellaneous rewrites
 
 This section covers a number of transformations that are accessible as
-code actions of kind `refactor.rewrite`.
+code actions whose kinds are children of `refactor.rewrite`.
 
-<!-- See TODO comments in settings/codeactionkind.go about splitting
-     up "refactor.extract" into finer grained categories. -->
-
-### Remove unused parameter
+<a name='refactor.rewrite.removeUnusedParam'></a>
+### `refactor.rewrite.removeUnusedParam`: Remove unused parameter
 
 The [`unusedparams` analyzer](../analyzers.md#unusedparams) reports a
 diagnostic for each parameter that is not used within the function body.
 For example:
+
 ```go
 func f(x, y int) { // "unused parameter: x"
 	fmt.Println(y)
@@ -532,7 +629,52 @@ Observe that in the first call, the argument `chargeCreditCard()` was
 not deleted because of potential side effects, whereas in the second
 call, the argument 2, a constant, was safely deleted.
 
-### Convert string literal between raw and interpreted
+<a name='refactor.rewrite.moveParamLeft'></a>
+<a name='refactor.rewrite.moveParamRight'></a>
+### `refactor.rewrite.moveParam{Left,Right}`: Move function parameters
+
+When the selection is a parameter in a function or method signature, gopls
+offers a code action to move the parameter left or right (if feasible),
+updating all callers accordingly.
+
+For example:
+
+```go
+func Foo(x, y int) int {
+    return x + y
+}
+
+func _() {
+    _ = Foo(0, 1)
+}
+```
+
+becomes
+
+```go
+func Foo(y, x int) int {
+    return x + y
+}
+
+func _() {
+    _ = Foo(1, 0)
+}
+```
+
+following a request to move `x` right, or `y` left.
+
+This is a primitive building block of more general "Change signature"
+operations. We plan to generalize this to arbitrary signature rewriting, but
+the language server protocol does not currently offer good support for user
+input into refactoring operations (see
+[microsoft/language-server-protocol#1164](https://github.com/microsoft/language-server-protocol/issues/1164)).
+Therefore, any such refactoring will require custom client-side logic. (As a
+very hacky workaround, you can express arbitrary parameter movement by invoking
+Rename on the `func` keyword of a function declaration, but this interface is
+just a temporary stopgap.)
+
+<a name='refactor.rewrite.changeQuote'></a>
+### `refactor.rewrite.changeQuote`: Convert string literal between raw and interpreted
 
 When the selection is a string literal, gopls offers a code action
 to convert the string between raw form (`` `abc` ``) and interpreted
@@ -544,7 +686,8 @@ form (`"abc"`) where this is possible:
 Applying the code action a second time reverts back to the original
 form.
 
-### Invert 'if' condition
+<a name='refactor.rewrite.invertIf'></a>
+### `refactor.rewrite.invertIf`: Invert 'if' condition
 
 When the selection is within an `if`/`else` statement that is not
 followed by `else if`, gopls offers a code action to invert the
@@ -559,7 +702,9 @@ blocks.
      if the else block ends with a return statement; and thus applying
      the operation twice does not get you back to where you started. -->
 
-### Split elements into separate lines
+<a name='refactor.rewrite.splitLines'></a>
+<a name='refactor.rewrite.joinLines'></a>
+### `refactor.rewrite.{split,join}Lines`: Split elements into separate lines
 
 When the selection is within a bracketed list of items such as:
 
@@ -594,6 +739,7 @@ func() (
 	z rune,
 )
 ```
+
 Observe that in the last two cases, each
 [group](https://pkg.go.dev/go/ast#Field) of parameters or results is
 treated as a single item.
@@ -604,10 +750,11 @@ respectively, or trivial (fewer than two items).
 
 These code actions are not offered for lists containing `//`-style
 comments, which run to the end of the line.
+
 <!-- Strictly, line comments make only "join" (but not "split") infeasible. -->
 
-
-### Fill struct literal
+<a name='refactor.rewrite.fillStruct'></a>
+### `refactor.rewrite.fillStruct`: Fill struct literal
 
 When the cursor is within a struct literal `S{}`, gopls offers the
 "Fill S" code action, which populates each missing field of the
@@ -639,7 +786,8 @@ Caveats:
   or in other files in the package, are not considered; see
   golang/go#68224.
 
-### Fill switch
+<a name='refactor.rewrite.fillSwitch'></a>
+### `refactor.rewrite.fillSwitch`: Fill switch
 
 When the cursor is within a switch statement whose operand type is an
 _enum_ (a finite set of named constants), or within a type switch,
@@ -666,3 +814,12 @@ which HTML documents are composed:
 
 ![Before "Add cases for Addr"](../assets/fill-switch-enum-before.png)
 ![After "Add cases for Addr"](../assets/fill-switch-enum-after.png)
+
+
+<a name='refactor.rewrite.eliminateDotImport'></a>
+### `refactor.rewrite.eliminateDotImport`: Eliminate dot import
+
+When the cursor is on a dot import gopls can offer the "Eliminate dot import"
+code action, which removes the dot from the import and qualifies uses of the
+package throughout the file. This code action is offered only if
+each use of the package can be qualified without collisions with existing names.

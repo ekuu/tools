@@ -22,6 +22,12 @@ A definition query also works in these unexpected places:
   (like [`hover`](passive.md#hover)) the location of the linked symbol.
 - On a file name in a **[`go:embed` directive](https://pkg.go.dev/embed)**,
   it returns the location of the embedded file.
+- On the declaration of a non-Go function (a `func` with no body),
+  it returns the location of the assembly implementation, if any,
+- On a **return statement**, it returns the location of the function's result variables.
+- On a **goto**, **break**, or **continue** statement, it returns the
+  location of the label, the closing brace of the relevant block statement, or the
+  start of the relevant loop, respectively.
 
 <!-- On a built-in symbol such as `append` or `unsafe.Pointer`, `definition` reports
 the location of the declaration in the builtin or unsafe pseudo-packages,
@@ -79,7 +85,10 @@ Client support:
 
 The LSP
 [`textDocument/implementation`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_implementation)
-request queries the "implements" relation between interfaces and concrete types:
+request queries the relation between abstract and concrete types and
+their methods.
+
+Interfaces and concrete types are matched using method sets:
 
 - When invoked on a reference to an **interface type**, it returns the
   location of the declaration of each type that implements
@@ -105,7 +114,31 @@ types with methods due to embedding) may be missing from the results.
      but that is not consistent with the "scalable" gopls design.
 -->
 
-Generic types are currently not fully supported; see golang/go#59224.
+Functions, `func` types, and dynamic function calls are matched using signatures:
+
+- When invoked on the `func` token of a **function definition**,
+  it returns the locations of the matching signature types
+  and dynamic call expressions.
+- When invoked on the `func` token of a **signature type**,
+  it returns the locations of the matching concrete function definitions.
+- When invoked on the `(` token of a **dynamic function call**,
+  it returns the locations of the matching concrete function
+  definitions.
+
+If either the target type or the candidate type are generic, the
+results will include the candidate type if there is any instantiation
+of the two types that would allow one to implement the other.
+(Note: the matcher doesn't current implement full unification, so type
+parameters are treated like wildcards that may match arbitrary
+types, without regard to consistency of substitutions across the
+method set or even within a single method.
+This may lead to occasional spurious matches.)
+
+Since a type may be both a function type and a named type with methods
+(for example, `http.HandlerFunc`), it may participate in both kinds of
+implementation queries (by method-sets and function signatures).
+Queries using method-sets should be invoked on the type or method name,
+and queries using signatures should be invoked on a `func` or `(` token.
 
 Client support:
 - **VS Code**: Use [Go to Implementations](https://code.visualstudio.com/docs/editor/editingevolved#_go-to-implementation) (`⌘F12`).

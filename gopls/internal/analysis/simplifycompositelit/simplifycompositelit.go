@@ -19,7 +19,6 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
-	"golang.org/x/tools/gopls/internal/util/astutil"
 	"golang.org/x/tools/internal/analysisinternal"
 )
 
@@ -34,12 +33,12 @@ var Analyzer = &analysis.Analyzer{
 	URL:      "https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/simplifycompositelit",
 }
 
-func run(pass *analysis.Pass) (interface{}, error) {
+func run(pass *analysis.Pass) (any, error) {
 	// Gather information whether file is generated or not
 	generated := make(map[*token.File]bool)
 	for _, file := range pass.Files {
-		if astutil.IsGenerated(file) {
-			generated[pass.Fset.File(file.Pos())] = true
+		if ast.IsGenerated(file) {
+			generated[pass.Fset.File(file.FileStart)] = true
 		}
 	}
 

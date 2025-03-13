@@ -61,12 +61,12 @@ flags:
     	filename to log to. if value is "auto", then logging to a default output file is enabled
   -mode=string
     	no effect
-  -ocagent=string
-    	the address of the ocagent (e.g. http://localhost:55678), or off (default "off")
   -port=int
     	port on which to run gopls for debugging purposes
   -profile.alloc=string
     	write alloc profile to this file
+  -profile.block=string
+    	write block profile to this file
   -profile.cpu=string
     	write CPU profile to this file
   -profile.mem=string

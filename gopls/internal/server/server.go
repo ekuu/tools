@@ -303,7 +303,7 @@ func (s *server) initWeb() (*web, error) {
 		openClientEditor(req.Context(), s.client, protocol.Location{
 			URI:   uri,
 			Range: protocol.Range{Start: posn, End: posn},
-		})
+		}, s.Options())
 	})
 
 	// The /pkg/PATH&view=... handler shows package documentation for PATH.
@@ -447,12 +447,7 @@ func (s *server) initWeb() (*web, error) {
 		pkg := pkgs[0]
 
 		// Produce report.
-		html, err := golang.AssemblyHTML(ctx, snapshot, pkg, symbol, web)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Write(html)
+		golang.AssemblyHTML(ctx, snapshot, w, pkg, symbol, web)
 	})
 
 	return web, nil

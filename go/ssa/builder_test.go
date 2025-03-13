@@ -6,31 +6,30 @@ package ssa_test
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"go/ast"
-	"go/build"
 	"go/importer"
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/tools/go/analysis/analysistest"
-	"golang.org/x/tools/go/buildutil"
-	"golang.org/x/tools/go/loader"
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
 	"golang.org/x/tools/go/ssa/ssautil"
-	"golang.org/x/tools/internal/aliases"
+	"golang.org/x/tools/internal/expect"
 	"golang.org/x/tools/internal/testenv"
-	"golang.org/x/tools/internal/testfiles"
 )
 
 func isEmpty(f *ssa.Function) bool { return f.Blocks == nil }
@@ -175,11 +174,8 @@ func main() {
 func TestNoIndirectCreatePackage(t *testing.T) {
 	testenv.NeedsGoBuild(t) // for go/packages
 
-	dir := testfiles.ExtractTxtarFileToTmp(t, filepath.Join(analysistest.TestData(), "indirect.txtar"))
-	pkgs, err := loadPackages(dir, "testdata/a")
-	if err != nil {
-		t.Fatal(err)
-	}
+	fs := openTxtar(t, filepath.Join(analysistest.TestData(), "indirect.txtar"))
+	pkgs := loadPackages(t, fs, "testdata/a")
 	a := pkgs[0]
 
 	// Create a from syntax, its direct deps b from types, but not indirect deps c.
@@ -207,27 +203,6 @@ func TestNoIndirectCreatePackage(t *testing.T) {
 	}
 }
 
-// loadPackages loads packages from the specified directory, using LoadSyntax.
-func loadPackages(dir string, patterns ...string) ([]*packages.Package, error) {
-	cfg := &packages.Config{
-		Dir:  dir,
-		Mode: packages.LoadSyntax,
-		Env: append(os.Environ(),
-			"GO111MODULES=on",
-			"GOPATH=",
-			"GOWORK=off",
-			"GOPROXY=off"),
-	}
-	pkgs, err := packages.Load(cfg, patterns...)
-	if err != nil {
-		return nil, err
-	}
-	if packages.PrintErrors(pkgs) > 0 {
-		return nil, fmt.Errorf("there were errors")
-	}
-	return pkgs, nil
-}
-
 // TestRuntimeTypes tests that (*Program).RuntimeTypes() includes all necessary types.
 func TestRuntimeTypes(t *testing.T) {
 	testenv.NeedsGoBuild(t) // for importer.Default()
@@ -239,7 +214,7 @@ func TestRuntimeTypes(t *testing.T) {
 		input string
 		want  []string
 	}{
-		// An package-level type is needed.
+		// A package-level type is needed.
 		{`package A; type T struct{}; func (T) f() {}; var x any = T{}`,
 			[]string{"*p.T", "p.T"},
 		},
@@ -374,37 +349,23 @@ func init():
 	}
 	for _, test := range tests {
 		// Create a single-file main package.
-		var conf loader.Config
-		f, err := conf.ParseFile("<input>", test.input)
-		if err != nil {
-			t.Errorf("test %q: %s", test.input[:15], err)
-			continue
-		}
-		conf.CreateFromFiles(f.Name.Name, f)
-
-		lprog, err := conf.Load()
-		if err != nil {
-			t.Errorf("test 'package %s': Load: %s", f.Name.Name, err)
-			continue
-		}
-		prog := ssautil.CreateProgram(lprog, test.mode)
-		mainPkg := prog.Package(lprog.Created[0].Pkg)
-		prog.Build()
+		mainPkg, _ := buildPackage(t, test.input, test.mode)
+		name := mainPkg.Pkg.Name()
 		initFunc := mainPkg.Func("init")
 		if initFunc == nil {
-			t.Errorf("test 'package %s': no init function", f.Name.Name)
+			t.Errorf("test 'package %s': no init function", name)
 			continue
 		}
 
 		var initbuf bytes.Buffer
-		_, err = initFunc.WriteTo(&initbuf)
+		_, err := initFunc.WriteTo(&initbuf)
 		if err != nil {
-			t.Errorf("test 'package %s': WriteTo: %s", f.Name.Name, err)
+			t.Errorf("test 'package %s': WriteTo: %s", name, err)
 			continue
 		}
 
 		if initbuf.String() != test.want {
-			t.Errorf("test 'package %s': got %s, want %s", f.Name.Name, initbuf.String(), test.want)
+			t.Errorf("test 'package %s': got %s, want %s", name, initbuf.String(), test.want)
 		}
 	}
 }
@@ -444,23 +405,7 @@ var (
 	t interface{} = new(struct{*T})
 )
 `
-	// Parse
-	var conf loader.Config
-	f, err := conf.ParseFile("<input>", input)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	conf.CreateFromFiles(f.Name.Name, f)
-
-	// Load
-	lprog, err := conf.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	// Create and build SSA
-	prog := ssautil.CreateProgram(lprog, ssa.BuilderMode(0))
-	prog.Build()
+	pkg, _ := buildPackage(t, input, ssa.BuilderMode(0))
 
 	// Enumerate reachable synthetic functions
 	want := map[string]string{
@@ -484,7 +429,7 @@ var (
 		"P.init": "package initializer",
 	}
 	var seen []string // may contain dups
-	for fn := range ssautil.AllFunctions(prog) {
+	for fn := range ssautil.AllFunctions(pkg.Prog) {
 		if fn.Synthetic == "" {
 			continue
 		}
@@ -555,24 +500,7 @@ func h(error)
 	//         t8 = phi [1: t7, 3: t4] #e
 	//         ...
 
-	// Parse
-	var conf loader.Config
-	f, err := conf.ParseFile("<input>", input)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	conf.CreateFromFiles("p", f)
-
-	// Load
-	lprog, err := conf.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	// Create and build SSA
-	prog := ssautil.CreateProgram(lprog, ssa.BuilderMode(0))
-	p := prog.Package(lprog.Package("p").Pkg)
-	p.Build()
+	p, _ := buildPackage(t, input, ssa.BuilderMode(0))
 	g := p.Func("g")
 
 	phis := 0
@@ -621,24 +549,7 @@ func LoadPointer(addr *unsafe.Pointer) (val unsafe.Pointer)
 	//      func  init        func()
 	//      var   init$guard  bool
 
-	// Parse
-	var conf loader.Config
-	f, err := conf.ParseFile("<input>", input)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	conf.CreateFromFiles("p", f)
-
-	// Load
-	lprog, err := conf.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	// Create and build SSA
-	prog := ssautil.CreateProgram(lprog, ssa.BuilderMode(0))
-	p := prog.Package(lprog.Package("p").Pkg)
-	p.Build()
+	p, _ := buildPackage(t, input, ssa.BuilderMode(0))
 
 	if load := p.Func("Load"); load.Signature.TypeParams().Len() != 1 {
 		t.Errorf("expected a single type param T for Load got %q", load.Signature)
@@ -674,25 +585,8 @@ var indirect = R[int].M
 	// var   thunk      func(S[int]) int
 	// var   wrapper    func(R[int]) int
 
-	// Parse
-	var conf loader.Config
-	f, err := conf.ParseFile("<input>", input)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	conf.CreateFromFiles("p", f)
-
-	// Load
-	lprog, err := conf.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
 	for _, mode := range []ssa.BuilderMode{ssa.BuilderMode(0), ssa.InstantiateGenerics} {
-		// Create and build SSA
-		prog := ssautil.CreateProgram(lprog, mode)
-		p := prog.Package(lprog.Package("p").Pkg)
-		p.Build()
+		p, _ := buildPackage(t, input, mode)
 
 		for _, entry := range []struct {
 			name    string // name of the package variable
@@ -773,63 +667,71 @@ var indirect = R[int].M
 // TestTypeparamTest builds SSA over compilable examples in $GOROOT/test/typeparam/*.go.
 
 func TestTypeparamTest(t *testing.T) {
-	// Tests use a fake goroot to stub out standard libraries with delcarations in
+	testenv.NeedsGOROOTDir(t, "test")
+
+	// Tests use a fake goroot to stub out standard libraries with declarations in
 	// testdata/src. Decreases runtime from ~80s to ~1s.
 
-	dir := filepath.Join(build.Default.GOROOT, "test", "typeparam")
+	if runtime.GOARCH == "wasm" {
+		// Consistent flakes on wasm (#64726, #69409, #69410).
+		// Needs more investigation, but more likely a wasm issue
+		// Disabling for now.
+		t.Skip("Consistent flakes on wasm (e.g. https://go.dev/issues/64726)")
+	}
+
+	// located GOROOT based on the relative path of errors in $GOROOT/src/errors
+	stdPkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedFiles,
+	}, "errors")
+	if err != nil {
+		t.Fatalf("Failed to load errors package from std: %s", err)
+	}
+	goroot := filepath.Dir(filepath.Dir(filepath.Dir(stdPkgs[0].GoFiles[0])))
+	dir := filepath.Join(goroot, "test", "typeparam")
+	if _, err = os.Stat(dir); errors.Is(err, os.ErrNotExist) {
+		t.Skipf("test/typeparam doesn't exist under GOROOT %s", goroot)
+	}
 
 	// Collect all of the .go files in
-	list, err := os.ReadDir(dir)
+	fsys := os.DirFS(dir)
+	entries, err := fs.ReadDir(fsys, ".")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	for _, entry := range list {
-		if entry.Name() == "issue58513.go" {
-			continue // uses runtime.Caller; unimplemented by go/ssa/interp
-		}
+	// Each call to buildPackage calls package.Load, which invokes "go list",
+	// and with over 300 subtests this can be very slow (minutes, or tens
+	// on some platforms). So, we use an overlay to map each test file to a
+	// distinct single-file package and load them all at once.
+	overlay := map[string][]byte{
+		"go.mod": goMod("example.com", -1),
+	}
+	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
 			continue // Consider standalone go files.
 		}
-		input := filepath.Join(dir, entry.Name())
-		t.Run(entry.Name(), func(t *testing.T) {
-			src, err := os.ReadFile(input)
-			if err != nil {
-				t.Fatal(err)
-			}
-			// Only build test files that can be compiled, or compiled and run.
-			if !bytes.HasPrefix(src, []byte("// run")) && !bytes.HasPrefix(src, []byte("// compile")) {
-				t.Skipf("not detected as a run test")
-			}
+		src, err := fs.ReadFile(fsys, entry.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Only build test files that can be compiled, or compiled and run.
+		if !bytes.HasPrefix(src, []byte("// run")) && !bytes.HasPrefix(src, []byte("// compile")) {
+			t.Logf("%s: not detected as a run test", entry.Name())
+			continue
+		}
 
-			t.Logf("Input: %s\n", input)
+		filename := fmt.Sprintf("%s/main.go", entry.Name())
+		overlay[filename] = src
+	}
 
-			ctx := build.Default    // copy
-			ctx.GOROOT = "testdata" // fake goroot. Makes tests ~1s. tests take ~80s.
-
-			reportErr := func(err error) {
-				t.Error(err)
-			}
-			conf := loader.Config{Build: &ctx, TypeChecker: types.Config{Error: reportErr}}
-			if _, err := conf.FromArgs([]string{input}, true); err != nil {
-				t.Fatalf("FromArgs(%s) failed: %s", input, err)
-			}
-
-			iprog, err := conf.Load()
-			if iprog != nil {
-				for _, pkg := range iprog.Created {
-					for i, e := range pkg.Errors {
-						t.Errorf("Loading pkg %s error[%d]=%s", pkg, i, e)
-					}
-				}
-			}
-			if err != nil {
-				t.Fatalf("conf.Load(%s) failed: %s", input, err)
-			}
-
-			mode := ssa.SanityCheckFunctions | ssa.InstantiateGenerics
-			prog := ssautil.CreateProgram(iprog, mode)
-			prog.Build()
+	// load all packages inside the overlay so 'go list' will be triggered only once.
+	pkgs := loadPackages(t, overlayFS(overlay), "./...")
+	for _, p := range pkgs {
+		originFilename := filepath.Base(filepath.Dir(p.GoFiles[0]))
+		t.Run(originFilename, func(t *testing.T) {
+			t.Parallel()
+			prog, _ := ssautil.Packages([]*packages.Package{p}, ssa.SanityCheckFunctions|ssa.InstantiateGenerics)
+			prog.Package(p.Types).Build()
 		})
 	}
 }
@@ -851,24 +753,7 @@ func sliceMax(s []int) []int { return s[a():b():c()] }
 
 `
 
-	// Parse
-	var conf loader.Config
-	f, err := conf.ParseFile("<input>", input)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	conf.CreateFromFiles("p", f)
-
-	// Load
-	lprog, err := conf.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	// Create and build SSA
-	prog := ssautil.CreateProgram(lprog, ssa.BuilderMode(0))
-	p := prog.Package(lprog.Package("p").Pkg)
-	p.Build()
+	p, _ := buildPackage(t, input, ssa.BuilderMode(0))
 
 	for _, item := range []struct {
 		fn   string
@@ -900,30 +785,28 @@ func sliceMax(s []int) []int { return s[a():b():c()] }
 
 // TestGenericFunctionSelector ensures generic functions from other packages can be selected.
 func TestGenericFunctionSelector(t *testing.T) {
-	pkgs := map[string]map[string]string{
-		"main": {"m.go": `package main; import "a"; func main() { a.F[int](); a.G[int,string](); a.H(0) }`},
-		"a":    {"a.go": `package a; func F[T any](){}; func G[S, T any](){}; func H[T any](a T){} `},
-	}
+	fsys := overlayFS(map[string][]byte{
+		"go.mod":  goMod("example.com", -1),
+		"main.go": []byte(`package main; import "example.com/a"; func main() { a.F[int](); a.G[int,string](); a.H(0) }`),
+		"a/a.go":  []byte(`package a; func F[T any](){}; func G[S, T any](){}; func H[T any](a T){} `),
+	})
 
 	for _, mode := range []ssa.BuilderMode{
 		ssa.SanityCheckFunctions,
 		ssa.SanityCheckFunctions | ssa.InstantiateGenerics,
 	} {
-		conf := loader.Config{
-			Build: buildutil.FakeContext(pkgs),
-		}
-		conf.Import("main")
 
-		lprog, err := conf.Load()
-		if err != nil {
-			t.Errorf("Load failed: %s", err)
+		pkgs := loadPackages(t, fsys, "example.com") // package main
+		if len(pkgs) != 1 {
+			t.Fatalf("Expected 1 root package but got %d", len(pkgs))
 		}
-		if lprog == nil {
-			t.Fatalf("Load returned nil *Program")
+		prog, _ := ssautil.Packages(pkgs, mode)
+		p := prog.Package(pkgs[0].Types)
+		p.Build()
+
+		if p.Pkg.Name() != "main" {
+			t.Fatalf("Expected the second package is main but got %s", p.Pkg.Name())
 		}
-		// Create and build SSA
-		prog := ssautil.CreateProgram(lprog, mode)
-		p := prog.Package(lprog.Package("main").Pkg)
 		p.Build()
 
 		var callees []string // callees of the CallInstruction.String() in main().
@@ -940,7 +823,7 @@ func TestGenericFunctionSelector(t *testing.T) {
 		}
 		sort.Strings(callees) // ignore the order in the code.
 
-		want := "[a.F[int] a.G[int string] a.H[int]]"
+		want := "[example.com/a.F[int] example.com/a.G[int string] example.com/a.H[int]]"
 		if got := fmt.Sprint(callees); got != want {
 			t.Errorf("Expected main() to contain calls %v. got %v", want, got)
 		}
@@ -1039,7 +922,7 @@ func TestIssue58491Rec(t *testing.T) {
 	// Find the local type result instantiated with int.
 	var found bool
 	for _, rt := range p.Prog.RuntimeTypes() {
-		if n, ok := aliases.Unalias(rt).(*types.Named); ok {
+		if n, ok := types.Unalias(rt).(*types.Named); ok {
 			if u, ok := n.Underlying().(*types.Struct); ok {
 				found = true
 				if got, want := n.String(), "p.result"; got != want {
@@ -1082,23 +965,8 @@ func TestSyntax(t *testing.T) {
 	var _ = F[P] // unreferenced => not instantiated
 	`
 
-	// Parse
-	var conf loader.Config
-	f, err := conf.ParseFile("<input>", input)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	conf.CreateFromFiles("p", f)
-
-	// Load
-	lprog, err := conf.Load()
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	// Create and build SSA
-	prog := ssautil.CreateProgram(lprog, ssa.InstantiateGenerics)
-	prog.Build()
+	p, _ := buildPackage(t, input, ssa.InstantiateGenerics)
+	prog := p.Prog
 
 	// Collect syntax information for all of the functions.
 	got := make(map[string]string)
@@ -1171,21 +1039,7 @@ func TestLabels(t *testing.T) {
 		  func main() { _:println(1); _:println(2)}`,
 	}
 	for _, test := range tests {
-		conf := loader.Config{Fset: token.NewFileSet()}
-		f, err := parser.ParseFile(conf.Fset, "<input>", test, 0)
-		if err != nil {
-			t.Errorf("parse error: %s", err)
-			return
-		}
-		conf.CreateFromFiles("main", f)
-		iprog, err := conf.Load()
-		if err != nil {
-			t.Error(err)
-			continue
-		}
-		prog := ssautil.CreateProgram(iprog, ssa.BuilderMode(0))
-		pkg := prog.Package(iprog.Created[0].Pkg)
-		pkg.Build()
+		buildPackage(t, test, ssa.BuilderMode(0))
 	}
 }
 
@@ -1219,22 +1073,8 @@ func TestIssue67079(t *testing.T) {
 
 	// Load the package.
 	const src = `package p; type T int; func (T) f() {}; var _ = (*T).f`
-	conf := loader.Config{Fset: token.NewFileSet()}
-	f, err := parser.ParseFile(conf.Fset, "p.go", src, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conf.CreateFromFiles("p", f)
-	iprog, err := conf.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	pkg := iprog.Created[0].Pkg
-
-	// Create and build SSA program.
-	prog := ssautil.CreateProgram(iprog, ssa.BuilderMode(0))
-	prog.Build()
-
+	spkg, ppkg := buildPackage(t, src, ssa.BuilderMode(0))
+	prog := spkg.Prog
 	var g errgroup.Group
 
 	// Access bodies of all functions.
@@ -1253,7 +1093,7 @@ func TestIssue67079(t *testing.T) {
 
 	// Force building of wrappers.
 	g.Go(func() error {
-		ptrT := types.NewPointer(pkg.Scope().Lookup("T").Type())
+		ptrT := types.NewPointer(ppkg.Types.Scope().Lookup("T").Type())
 		ptrTf := types.NewMethodSet(ptrT).At(0) // (*T).f symbol
 		prog.MethodValue(ptrTf)
 		return nil
@@ -1294,10 +1134,10 @@ func TestGenericAliases(t *testing.T) {
 }
 
 func testGenericAliases(t *testing.T) {
-	t.Setenv("GOEXPERIMENT", "aliastypeparams=1")
+	testenv.NeedsGoExperiment(t, "aliastypeparams")
 
 	const source = `
-package P
+package p
 
 type A = uint8
 type B[T any] = [4]T
@@ -1329,22 +1169,9 @@ func f[S any]() {
 }
 `
 
-	conf := loader.Config{Fset: token.NewFileSet()}
-	f, err := parser.ParseFile(conf.Fset, "p.go", source, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	conf.CreateFromFiles("p", f)
-	iprog, err := conf.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
+	p, _ := buildPackage(t, source, ssa.InstantiateGenerics)
 
-	// Create and build SSA program.
-	prog := ssautil.CreateProgram(iprog, ssa.InstantiateGenerics)
-	prog.Build()
-
-	probes := callsTo(ssautil.AllFunctions(prog), "print")
+	probes := callsTo(ssautil.AllFunctions(p.Prog), "print")
 	if got, want := len(probes), 3*4*2; got != want {
 		t.Errorf("Found %v probes, expected %v", got, want)
 	}
@@ -1400,4 +1227,261 @@ func constString(v ssa.Value) string {
 		return strings.Trim(str, `"`)
 	}
 	return "<not a constant string>"
+}
+
+// TestMultipleGoversions tests that globals initialized to equivalent
+// function literals are compiled based on the different GoVersion in each file.
+func TestMultipleGoversions(t *testing.T) {
+	var contents = map[string]string{
+		"post.go": `
+	//go:build go1.22
+	package p
+
+	var distinct = func(l []int) {
+		for i := range l {
+			print(&i)
+		}
+	}
+	`,
+		"pre.go": `
+	package p
+
+	var same = func(l []int) {
+		for i := range l {
+			print(&i)
+		}
+	}
+	`,
+	}
+
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, fname := range []string{"post.go", "pre.go"} {
+		file, err := parser.ParseFile(fset, fname, contents[fname], 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, file)
+	}
+
+	pkg := types.NewPackage("p", "")
+	conf := &types.Config{Importer: nil, GoVersion: "go1.21"}
+	p, _, err := ssautil.BuildPackage(conf, fset, pkg, files, ssa.SanityCheckFunctions)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test that global is initialized to a function literal that was
+	// compiled to have the expected for loop range variable lifetime for i.
+	for _, test := range []struct {
+		global *ssa.Global
+		want   string // basic block to []*ssa.Alloc.
+	}{
+		{p.Var("same"), "map[entry:[new int (i)]]"},               // i is allocated in the entry block.
+		{p.Var("distinct"), "map[rangeindex.body:[new int (i)]]"}, // i is allocated in the body block.
+	} {
+		// Find the function the test.name global is initialized to.
+		var fn *ssa.Function
+		for _, b := range p.Func("init").Blocks {
+			for _, instr := range b.Instrs {
+				if s, ok := instr.(*ssa.Store); ok && s.Addr == test.global {
+					fn, _ = s.Val.(*ssa.Function)
+				}
+			}
+		}
+		if fn == nil {
+			t.Fatalf("Failed to find *ssa.Function for initial value of global %s", test.global)
+		}
+
+		allocs := make(map[string][]string) // block comments -> []Alloc
+		for _, b := range fn.Blocks {
+			for _, instr := range b.Instrs {
+				if a, ok := instr.(*ssa.Alloc); ok {
+					allocs[b.Comment] = append(allocs[b.Comment], a.String())
+				}
+			}
+		}
+		if got := fmt.Sprint(allocs); got != test.want {
+			t.Errorf("[%s:=%s] expected the allocations to be in the basic blocks %q, got %q", test.global, fn, test.want, got)
+		}
+	}
+}
+
+// TestRangeOverInt tests that, in a range-over-int (#61405),
+// the type of each range var v (identified by print(v) calls)
+// has the expected type.
+func TestRangeOverInt(t *testing.T) {
+	const rangeOverIntSrc = `
+		package p
+
+		type I uint8
+
+		func noKey(x int) {
+			for range x {
+				// does not crash
+			}
+		}
+
+		func untypedConstantOperand() {
+			for i := range 10 {
+				print(i) /*@ types("int")*/
+			}
+		}
+
+		func unsignedOperand(x uint64) {
+			for i := range x {
+				print(i) /*@ types("uint64")*/
+			}
+		}
+
+		func namedOperand(x I) {
+			for i := range x {
+				print(i)  /*@ types("p.I")*/
+			}
+		}
+
+		func typeparamOperand[T int](x T) {
+			for i := range x {
+				print(i)  /*@ types("T")*/
+			}
+		}
+
+		func assignment(x I) {
+			var k I
+			for k = range x {
+				print(k) /*@ types("p.I")*/
+			}
+		}
+	`
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "p.go", rangeOverIntSrc, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pkg := types.NewPackage("p", "")
+	conf := &types.Config{}
+	p, _, err := ssautil.BuildPackage(conf, fset, pkg, []*ast.File{f}, ssa.SanityCheckFunctions)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Collect all notes in f, i.e. comments starting with "//@ types".
+	notes, err := expect.ExtractGo(fset, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Collect calls to the built-in print function.
+	fns := make(map[*ssa.Function]bool)
+	for _, mem := range p.Members {
+		if fn, ok := mem.(*ssa.Function); ok {
+			fns[fn] = true
+		}
+	}
+	probes := callsTo(fns, "print")
+	expectations := matchNotes(fset, notes, probes)
+
+	for call := range probes {
+		if expectations[call] == nil {
+			t.Errorf("Unmatched call: %v @ %s", call, fset.Position(call.Pos()))
+		}
+	}
+
+	// Check each expectation.
+	for call, note := range expectations {
+		var args []string
+		for _, a := range call.Args {
+			args = append(args, a.Type().String())
+		}
+		if got, want := fmt.Sprint(args), fmt.Sprint(note.Args); got != want {
+			at := fset.Position(call.Pos())
+			t.Errorf("%s: arguments to print had types %s, want %s", at, got, want)
+			logFunction(t, probes[call])
+		}
+	}
+}
+
+func TestBuildPackageGo120(t *testing.T) {
+	tests := []struct {
+		name     string
+		src      string
+		importer types.Importer
+	}{
+		{"slice to array", "package p; var s []byte; var _ = ([4]byte)(s)", nil},
+		{"slice to zero length array", "package p; var s []byte; var _ = ([0]byte)(s)", nil},
+		{"slice to zero length array type parameter", "package p; var s []byte; func f[T ~[0]byte]() { tmp := (T)(s); var z T; _ = tmp == z}", nil},
+		{"slice to non-zero length array type parameter", "package p; var s []byte; func h[T ~[1]byte | [4]byte]() { tmp := T(s); var z T; _ = tmp == z}", nil},
+		{"slice to maybe-zero length array type parameter", "package p; var s []byte; func g[T ~[0]byte | [4]byte]() { tmp := T(s); var z T; _ = tmp == z}", nil},
+		{
+			"rune sequence to sequence cast patterns", `
+			package p
+			// Each of fXX functions describes a 1.20 legal cast between sequences of runes
+			// as []rune, pointers to rune arrays, rune arrays, or strings.
+			//
+			// Comments listed given the current emitted instructions [approximately].
+			// If multiple conversions are needed, these are separated by |.
+			// rune was selected as it leads to string casts (byte is similar).
+			// The length 2 is not significant.
+			// Multiple array lengths may occur in a cast in practice (including 0).
+			func f00[S string, D string](s S)                               { _ = D(s) } // ChangeType
+			func f01[S string, D []rune](s S)                               { _ = D(s) } // Convert
+			func f02[S string, D []rune | string](s S)                      { _ = D(s) } // ChangeType | Convert
+			func f03[S [2]rune, D [2]rune](s S)                             { _ = D(s) } // ChangeType
+			func f04[S *[2]rune, D *[2]rune](s S)                           { _ = D(s) } // ChangeType
+			func f05[S []rune, D string](s S)                               { _ = D(s) } // Convert
+			func f06[S []rune, D [2]rune](s S)                              { _ = D(s) } // SliceToArrayPointer; Deref
+			func f07[S []rune, D [2]rune | string](s S)                     { _ = D(s) } // SliceToArrayPointer; Deref | Convert
+			func f08[S []rune, D *[2]rune](s S)                             { _ = D(s) } // SliceToArrayPointer
+			func f09[S []rune, D *[2]rune | string](s S)                    { _ = D(s) } // SliceToArrayPointer; Deref | Convert
+			func f10[S []rune, D *[2]rune | [2]rune](s S)                   { _ = D(s) } // SliceToArrayPointer | SliceToArrayPointer; Deref
+			func f11[S []rune, D *[2]rune | [2]rune | string](s S)          { _ = D(s) } // SliceToArrayPointer | SliceToArrayPointer; Deref | Convert
+			func f12[S []rune, D []rune](s S)                               { _ = D(s) } // ChangeType
+			func f13[S []rune, D []rune | string](s S)                      { _ = D(s) } // Convert | ChangeType
+			func f14[S []rune, D []rune | [2]rune](s S)                     { _ = D(s) } // ChangeType | SliceToArrayPointer; Deref
+			func f15[S []rune, D []rune | [2]rune | string](s S)            { _ = D(s) } // ChangeType | SliceToArrayPointer; Deref | Convert
+			func f16[S []rune, D []rune | *[2]rune](s S)                    { _ = D(s) } // ChangeType | SliceToArrayPointer
+			func f17[S []rune, D []rune | *[2]rune | string](s S)           { _ = D(s) } // ChangeType | SliceToArrayPointer | Convert
+			func f18[S []rune, D []rune | *[2]rune | [2]rune](s S)          { _ = D(s) } // ChangeType | SliceToArrayPointer | SliceToArrayPointer; Deref
+			func f19[S []rune, D []rune | *[2]rune | [2]rune | string](s S) { _ = D(s) } // ChangeType | SliceToArrayPointer | SliceToArrayPointer; Deref | Convert
+			func f20[S []rune | string, D string](s S)                      { _ = D(s) } // Convert | ChangeType
+			func f21[S []rune | string, D []rune](s S)                      { _ = D(s) } // Convert | ChangeType
+			func f22[S []rune | string, D []rune | string](s S)             { _ = D(s) } // ChangeType | Convert | Convert | ChangeType
+			func f23[S []rune | [2]rune, D [2]rune](s S)                    { _ = D(s) } // SliceToArrayPointer; Deref | ChangeType
+			func f24[S []rune | *[2]rune, D *[2]rune](s S)                  { _ = D(s) } // SliceToArrayPointer | ChangeType
+			`, nil,
+		},
+		{
+			"matching named and underlying types", `
+			package p
+			type a string
+			type b string
+			func g0[S []rune | a | b, D []rune | a | b](s S)      { _ = D(s) }
+			func g1[S []rune | ~string, D []rune | a | b](s S)    { _ = D(s) }
+			func g2[S []rune | a | b, D []rune | ~string](s S)    { _ = D(s) }
+			func g3[S []rune | ~string, D []rune |~string](s S)   { _ = D(s) }
+			`, nil,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, "p.go", tc.src, 0)
+			if err != nil {
+				t.Error(err)
+			}
+			files := []*ast.File{f}
+
+			pkg := types.NewPackage("p", "")
+			conf := &types.Config{Importer: tc.importer}
+			_, _, err = ssautil.BuildPackage(conf, fset, pkg, files, ssa.SanityCheckFunctions)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
 }

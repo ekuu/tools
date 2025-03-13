@@ -14,7 +14,6 @@ import (
 	"golang.org/x/tools/gopls/internal/protocol"
 	. "golang.org/x/tools/gopls/internal/test/integration"
 	"golang.org/x/tools/gopls/internal/test/integration/fake"
-	"golang.org/x/tools/internal/testenv"
 )
 
 func TestHoverUnexported(t *testing.T) {
@@ -22,7 +21,7 @@ func TestHoverUnexported(t *testing.T) {
 -- golang.org/x/structs@v1.0.0/go.mod --
 module golang.org/x/structs
 
-go 1.12
+go 1.21
 
 -- golang.org/x/structs@v1.0.0/types.go --
 package structs
@@ -41,12 +40,9 @@ func printMixed(m Mixed) {
 -- go.mod --
 module mod.com
 
-go 1.12
+go 1.21
 
 require golang.org/x/structs v1.0.0
--- go.sum --
-golang.org/x/structs v1.0.0 h1:Ito/a7hBYZaNKShFrZKjfBA/SIPvmBrcPCBWPx5QeKk=
-golang.org/x/structs v1.0.0/go.mod h1:47gkSIdo5AaQaWJS0upVORsxfEr1LL1MWv9dmYF3iq4=
 -- main.go --
 package main
 
@@ -61,6 +57,7 @@ func main() {
 	// TODO: use a nested workspace folder here.
 	WithOptions(
 		ProxyFiles(proxy),
+		WriteGoSum("."),
 	).Run(t, mod, func(t *testing.T, env *Env) {
 		env.OpenFile("main.go")
 		mixedLoc := env.RegexpSearch("main.go", "Mixed")
@@ -282,7 +279,6 @@ go 1.16
 }
 
 func TestHoverCompletionMarkdown(t *testing.T) {
-	testenv.NeedsGo1Point(t, 19)
 	const source = `
 -- go.mod --
 module mod.com
@@ -343,7 +339,6 @@ func Hello() string {
 // Test that the generated markdown contains links for Go references.
 // https://github.com/golang/go/issues/58352
 func TestHoverLinks(t *testing.T) {
-	testenv.NeedsGo1Point(t, 19)
 	const input = `
 -- go.mod --
 go 1.19
@@ -465,7 +460,6 @@ SKIPPED
 `
 
 func TestHoverEmbedDirective(t *testing.T) {
-	testenv.NeedsGo1Point(t, 19)
 	Run(t, embedHover, func(t *testing.T, env *Env) {
 		env.OpenFile("main.go")
 		from := env.RegexpSearch("main.go", `\*.txt`)
@@ -596,7 +590,7 @@ func main() {
 	).Run(t, mod, func(t *testing.T, env *Env) {
 		env.OpenFile("main.go")
 		got, _ := env.Hover(env.RegexpSearch("main.go", "F"))
-		const wantRE = "\\[`a.F` in gopls doc viewer\\]\\(http://127.0.0.1:[0-9]+/gopls/[^/]+/pkg/example.com\\?view=[0-9]+#F\\)" // no version
+		const wantRE = "\\[`a.F` in gopls doc viewer\\]\\(http://127.0.0.1:[0-9]+/gopls/[^/]+/pkg/example.com/a\\?view=[0-9]+#F\\)" // no version
 		if m, err := regexp.MatchString(wantRE, got.Value); err != nil {
 			t.Fatalf("bad regexp in test: %v", err)
 		} else if !m {
@@ -606,8 +600,6 @@ func main() {
 }
 
 func TestHoverBuiltinFile(t *testing.T) {
-	testenv.NeedsGo1Point(t, 21) // uses 'min'
-
 	// This test verifies that hovering in the builtin file provides the same
 	// hover content as hovering over a use of a builtin.
 

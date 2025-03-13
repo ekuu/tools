@@ -40,6 +40,7 @@ import (
 	"go/types"
 	"html"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
@@ -49,8 +50,6 @@ import (
 	goplsastutil "golang.org/x/tools/gopls/internal/util/astutil"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
-	"golang.org/x/tools/gopls/internal/util/slices"
-	"golang.org/x/tools/gopls/internal/util/typesutil"
 	"golang.org/x/tools/internal/stdlib"
 	"golang.org/x/tools/internal/typesinternal"
 )
@@ -120,7 +119,7 @@ func DocFragment(pkg *cache.Package, pgf *parsego.File, start, end token.Pos) (p
 	if !sym.Exported() {
 		// Unexported method of exported type?
 		if fn, ok := sym.(*types.Func); ok {
-			if recv := fn.Type().(*types.Signature).Recv(); recv != nil {
+			if recv := fn.Signature().Recv(); recv != nil {
 				_, named := typesinternal.ReceiverNamed(recv)
 				if named != nil && named.Obj().Exported() {
 					sym = named.Obj()
@@ -140,14 +139,14 @@ func DocFragment(pkg *cache.Package, pgf *parsego.File, start, end token.Pos) (p
 	}
 
 	// package-level symbol?
-	if isPackageLevel(sym) {
+	if typesinternal.IsPackageLevel(sym) {
 		return pkgpath, sym.Name(), makeTitle(objectKind(sym), sym.Pkg(), sym.Name())
 	}
 
 	// Inv: sym is field or method, or local.
 	switch sym := sym.(type) {
 	case *types.Func: // => method
-		sig := sym.Type().(*types.Signature)
+		sig := sym.Signature()
 		isPtr, named := typesinternal.ReceiverNamed(sig.Recv())
 		if named != nil {
 			if !named.Obj().Exported() {
@@ -199,7 +198,7 @@ func thingAtPoint(pkg *cache.Package, pgf *parsego.File, start, end token.Pos) t
 	// In an import spec?
 	if len(path) >= 3 { // [...ImportSpec GenDecl File]
 		if spec, ok := path[len(path)-3].(*ast.ImportSpec); ok {
-			if pkgname, ok := typesutil.ImportedPkgName(pkg.TypesInfo(), spec); ok {
+			if pkgname := pkg.TypesInfo().PkgNameOf(spec); pkgname != nil {
 				return thing{pkg: pkgname.Imported()}
 			}
 		}
@@ -270,6 +269,13 @@ type Web interface {
 // The posURL function returns a URL that when visited, has the side
 // effect of causing gopls to direct the client editor to navigate to
 // the specified file/line/column position, in UTF-8 coordinates.
+//
+// TODO(adonovan): this function could use some unit tests; we
+// shouldn't have to use integration tests to cover microdetails of
+// HTML rendering. (It is tempting to abstract this function so that
+// it depends only on FileSet/File/Types/TypeInfo/etc, but we should
+// bend the tests to the production interfaces, not the other way
+// around.)
 func PackageDocHTML(viewID string, pkg *cache.Package, web Web) ([]byte, error) {
 	// We can't use doc.NewFromFiles (even with doc.PreserveAST
 	// mode) as it calls ast.NewPackage which assumes that each
@@ -282,7 +288,7 @@ func PackageDocHTML(viewID string, pkg *cache.Package, web Web) ([]byte, error) 
 	// TODO(adonovan): simulate that too.
 	fileMap := make(map[string]*ast.File)
 	for _, f := range pkg.Syntax() {
-		fileMap[pkg.FileSet().File(f.Pos()).Name()] = f
+		fileMap[pkg.FileSet().File(f.FileStart).Name()] = f
 	}
 	astpkg := &ast.Package{
 		Name:  pkg.Types().Name(),
@@ -326,68 +332,34 @@ func PackageDocHTML(viewID string, pkg *cache.Package, web Web) ([]byte, error) 
 		})
 	}
 
-	var docHTML func(comment string) []byte
+	// docHTML renders the doc comment as Markdown.
+	// The fileNode is used to deduce the enclosing file
+	// for the correct import mapping.
+	//
+	// It is not concurrency-safe.
+	var docHTML func(fileNode ast.Node, comment string) []byte
 	{
 		// Adapt doc comment parser and printer
 		// to our representation of Go packages
 		// so that doc links (e.g. "[fmt.Println]")
 		// become valid links.
-
-		printer := docpkg.Printer()
-		printer.DocLinkURL = func(link *comment.DocLink) string {
-			path := pkg.Metadata().PkgPath
-			if link.ImportPath != "" {
-				path = PackagePath(link.ImportPath)
-			}
-			fragment := link.Name
-			if link.Recv != "" {
-				fragment = link.Recv + "." + link.Name
-			}
-			return web.PkgURL(viewID, path, fragment)
-		}
-		parser := docpkg.Parser()
-		parser.LookupPackage = func(name string) (importPath string, ok bool) {
-			// Ambiguous: different files in the same
-			// package may have different import mappings,
-			// but the hook doesn't provide the file context.
-			// TODO(adonovan): conspire with docHTML to
-			// pass the doc comment's enclosing file through
-			// a shared variable, so that we can compute
-			// the correct per-file mapping.
-			//
-			// TODO(adonovan): check for PkgName.Name
-			// matches, but also check for
-			// PkgName.Imported.Namer matches, since some
-			// packages are typically imported under a
-			// non-default name (e.g. pathpkg "path") but
-			// may be referred to in doc links using their
-			// canonical name.
-			for _, f := range pkg.Syntax() {
-				for _, imp := range f.Imports {
-					pkgName, ok := typesutil.ImportedPkgName(pkg.TypesInfo(), imp)
-					if ok && pkgName.Name() == name {
-						return pkgName.Imported().Path(), true
-					}
+		printer := &comment.Printer{
+			DocLinkURL: func(link *comment.DocLink) string {
+				path := pkg.Metadata().PkgPath
+				if link.ImportPath != "" {
+					path = PackagePath(link.ImportPath)
 				}
-			}
-			return "", false
+				fragment := link.Name
+				if link.Recv != "" {
+					fragment = link.Recv + "." + link.Name
+				}
+				return web.PkgURL(viewID, path, fragment)
+			},
 		}
-		parser.LookupSym = func(recv, name string) (ok bool) {
-			// package-level decl?
-			if recv == "" {
-				return pkg.Types().Scope().Lookup(name) != nil
-			}
-
-			// method?
-			tname, ok := pkg.Types().Scope().Lookup(recv).(*types.TypeName)
-			if !ok {
-				return false
-			}
-			m, _, _ := types.LookupFieldOrMethod(tname.Type(), true, pkg.Types(), name)
-			return is[*types.Func](m)
-		}
-		docHTML = func(comment string) []byte {
-			return printer.HTML(parser.Parse(comment))
+		parse := newDocCommentParser(pkg)
+		docHTML = func(fileNode ast.Node, comment string) []byte {
+			doc := parse(fileNode, comment)
+			return printer.HTML(doc)
 		}
 	}
 
@@ -469,7 +441,7 @@ window.addEventListener('load', function() {
 		label := obj.Name() // for a type
 		if fn, ok := obj.(*types.Func); ok {
 			var buf strings.Builder
-			sig := fn.Type().(*types.Signature)
+			sig := fn.Signature()
 			if sig.Recv() != nil {
 				fmt.Fprintf(&buf, "(%s) ", sig.Recv().Name())
 				fragment = recvType + "." + fn.Name()
@@ -551,7 +523,7 @@ window.addEventListener('load', function() {
 
 				// method of package-level named type?
 				if fn, ok := obj.(*types.Func); ok {
-					sig := fn.Type().(*types.Signature)
+					sig := fn.Signature()
 					if sig.Recv() != nil {
 						_, named := typesinternal.ReceiverNamed(sig.Recv())
 						if named != nil {
@@ -648,7 +620,7 @@ window.addEventListener('load', function() {
 	fnString := func(fn *types.Func) string {
 		pkgRelative := typesinternal.NameRelativeTo(pkg.Types())
 
-		sig := fn.Type().(*types.Signature)
+		sig := fn.Signature()
 
 		// Emit "func (recv T) F".
 		var buf bytes.Buffer
@@ -693,8 +665,8 @@ window.addEventListener('load', function() {
 				cloneTparams(sig.RecvTypeParams()),
 				cloneTparams(sig.TypeParams()),
 				types.NewTuple(append(
-					typesSeqToSlice[*types.Var](sig.Params())[:3],
-					types.NewVar(0, nil, "", types.Typ[types.Invalid]))...),
+					slices.Collect(sig.Params().Variables())[:3],
+					types.NewParam(0, nil, "", types.Typ[types.Invalid]))...),
 				sig.Results(),
 				false) // any final ...T parameter is truncated
 		}
@@ -715,7 +687,12 @@ window.addEventListener('load', function() {
 		"https://pkg.go.dev/"+string(pkg.Types().Path()))
 
 	// package doc
-	fmt.Fprintf(&buf, "<div class='comment'>%s</div>\n", docHTML(docpkg.Doc))
+	for _, f := range pkg.Syntax() {
+		if f.Doc != nil {
+			fmt.Fprintf(&buf, "<div class='comment'>%s</div>\n", docHTML(f.Doc, docpkg.Doc))
+			break
+		}
+	}
 
 	// symbol index
 	fmt.Fprintf(&buf, "<h2 id='hdr-Index'>Index</h2>\n")
@@ -773,7 +750,7 @@ window.addEventListener('load', function() {
 			fmt.Fprintf(&buf, "<pre class='code'>%s</pre>\n", nodeHTML(&decl2))
 
 			// comment (if any)
-			fmt.Fprintf(&buf, "<div class='comment'>%s</div>\n", docHTML(v.Doc))
+			fmt.Fprintf(&buf, "<div class='comment'>%s</div>\n", docHTML(v.Decl, v.Doc))
 		}
 	}
 	fmt.Fprintf(&buf, "<h2 id='hdr-Constants'>Constants</h2>\n")
@@ -814,7 +791,7 @@ window.addEventListener('load', function() {
 				nodeHTML(docfn.Decl.Type))
 
 			// comment (if any)
-			fmt.Fprintf(&buf, "<div class='comment'>%s</div>\n", docHTML(docfn.Doc))
+			fmt.Fprintf(&buf, "<div class='comment'>%s</div>\n", docHTML(docfn.Decl, docfn.Doc))
 		}
 	}
 	funcs(docpkg.Funcs)
@@ -835,7 +812,7 @@ window.addEventListener('load', function() {
 		fmt.Fprintf(&buf, "<pre class='code'>%s</pre>\n", nodeHTML(&decl2))
 
 		// comment (if any)
-		fmt.Fprintf(&buf, "<div class='comment'>%s</div>\n", docHTML(doctype.Doc))
+		fmt.Fprintf(&buf, "<div class='comment'>%s</div>\n", docHTML(doctype.Decl, doctype.Doc))
 
 		// subelements
 		values(doctype.Consts) // constants of type T
@@ -856,7 +833,7 @@ window.addEventListener('load', function() {
 
 			// comment (if any)
 			fmt.Fprintf(&buf, "<div class='comment'>%s</div>\n",
-				docHTML(docmethod.Doc))
+				docHTML(docmethod.Decl, docmethod.Doc))
 		}
 	}
 
@@ -872,20 +849,4 @@ window.addEventListener('load', function() {
 	fmt.Fprintf(&buf, "</html>\n")
 
 	return buf.Bytes(), nil
-}
-
-// typesSeq abstracts various go/types sequence types:
-// MethodSet, Tuple, TypeParamList, TypeList.
-// TODO(adonovan): replace with go1.23 iterators.
-type typesSeq[T any] interface {
-	Len() int
-	At(int) T
-}
-
-func typesSeqToSlice[T any](seq typesSeq[T]) []T {
-	slice := make([]T, seq.Len())
-	for i := range slice {
-		slice[i] = seq.At(i)
-	}
-	return slice
 }

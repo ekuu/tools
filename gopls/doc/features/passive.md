@@ -107,6 +107,10 @@ function call.
 
 <img src='../assets/signature-help.png'>
 
+Call parens are not necessary if the cursor is within an identifier
+that denotes a function or method. For example, Signature Help at
+`once.Do(initialize‸)` will describe `initialize`, not `once.Do`.
+
 Client support:
 - **VS Code**: enabled by default.
   Also known as "[parameter hints](https://code.visualstudio.com/api/references/vscode-api#SignatureHelpProvider)" in the [IntelliSense settings](https://code.visualstudio.com/docs/editor/intellisense#_settings).
@@ -134,6 +138,9 @@ select any one member, gopls will highlight the complete set:
 
 More than one of these rules may be activated by a single selection,
 for example, by an identifier that is also a return operand.
+
+Different occurrences of the same identifier may be color-coded to distinguish
+"read" from "write" references to a given variable symbol.
 
 <img src='../assets/document-highlight.png'>
 
@@ -204,7 +211,46 @@ a portion of it.
 The client may use this information to provide syntax highlighting
 that conveys semantic distinctions between, for example, functions and
 types, constants and variables, or library functions and built-ins.
-The client specifies the sets of types and modifiers it is interested in.
+
+The client must specify the sets of types and modifiers it is interested in.
+
+Gopls reports the following token types:
+
+- `"comment"`: a comment
+- `"function"`: a function
+- `"keyword"`: a keyword
+- `"label"`: a control label (not an LSP standard type)
+- `"macro"`: text/template tokens
+- `"method"`: a method
+- `"namespace"`: an imported package name
+- `"number"`: a numeric literal
+- `"operator"`: an operator
+- `"parameter"`: a parameter variable
+- `"string"`:  a string literal
+- `"type"`: a type name (plus other uses)
+- `"typeParameter"`: a type parameter
+- `"variable"`: a var or const (see `readonly` modifier)
+
+Gopls also reports the following standard modifiers:
+
+- `"defaultLibrary"`: predeclared symbols
+- `"definition"`: the declaring identifier of a symbol
+- `"readonly"`: for constants
+
+plus these non-standard modifiers each representing the top-level
+constructor of each symbols's type:
+
+- `"array"`
+- `"bool"`
+- `"chan"`
+- `"interface"`
+- `"map"`
+- `"number"`
+- `"pointer"`
+- `"signature"`
+- `"slice"`
+- `"string"`
+- `"struct"`
 
 Settings:
 - The [`semanticTokens`](../settings.md#semanticTokens) setting determines whether

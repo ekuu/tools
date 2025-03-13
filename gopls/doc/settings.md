@@ -88,7 +88,7 @@ Default: `["-**/node_modules"]`.
 <a id='templateExtensions'></a>
 ### `templateExtensions []string`
 
-templateExtensions gives the extensions of file names that are treateed
+templateExtensions gives the extensions of file names that are treated
 as template files. (The extension
 is the part of the file name after the final dot.)
 
@@ -119,17 +119,6 @@ gopls has to do to keep your workspace up to date.
 
 Default: `true`.
 
-<a id='allowImplicitNetworkAccess'></a>
-### `allowImplicitNetworkAccess bool`
-
-**This setting is experimental and may be deleted.**
-
-allowImplicitNetworkAccess disables GOPROXY=off, allowing implicit module
-downloads rather than requiring user action. This option will eventually
-be removed.
-
-Default: `false`.
-
 <a id='standaloneTags'></a>
 ### `standaloneTags []string`
 
@@ -153,6 +142,18 @@ main file.
 This setting is only supported when gopls is built with Go 1.16 or later.
 
 Default: `["ignore"]`.
+
+<a id='workspaceFiles'></a>
+### `workspaceFiles []string`
+
+workspaceFiles configures the set of globs that match files defining the
+logical build of the current workspace. Any on-disk changes to any files
+matching a glob specified here will trigger a reload of the workspace.
+
+This setting need only be customized in environments with a custom
+GOPACKAGESDRIVER.
+
+Default: `[]`.
 
 <a id='formatting'></a>
 ## Formatting
@@ -195,13 +196,12 @@ Example Usage:
 ...
   "codelenses": {
     "generate": false,  // Don't show the `go generate` lens.
-    "gc_details": true  // Show a code lens toggling the display of gc's choices.
   }
 ...
 }
 ```
 
-Default: `{"gc_details":false,"generate":true,"regenerate_cgo":true,"run_govulncheck":false,"tidy":true,"upgrade_dependency":true,"vendor":true}`.
+Default: `{"generate":true,"regenerate_cgo":true,"run_govulncheck":false,"tidy":true,"upgrade_dependency":true,"vendor":true}`.
 
 <a id='semanticTokens'></a>
 ### `semanticTokens bool`
@@ -220,6 +220,9 @@ Default: `false`.
 
 noSemanticString turns off the sending of the semantic token 'string'
 
+Deprecated: Use SemanticTokenTypes["string"] = false instead. See
+golang/vscode-go#3632
+
 Default: `false`.
 
 <a id='noSemanticNumber'></a>
@@ -227,9 +230,34 @@ Default: `false`.
 
 **This setting is experimental and may be deleted.**
 
-noSemanticNumber  turns off the sending of the semantic token 'number'
+noSemanticNumber turns off the sending of the semantic token 'number'
+
+Deprecated: Use SemanticTokenTypes["number"] = false instead. See
+golang/vscode-go#3632.
 
 Default: `false`.
+
+<a id='semanticTokenTypes'></a>
+### `semanticTokenTypes map[string]bool`
+
+**This setting is experimental and may be deleted.**
+
+semanticTokenTypes configures the semantic token types. It allows
+disabling types by setting each value to false.
+By default, all types are enabled.
+
+Default: `{}`.
+
+<a id='semanticTokenModifiers'></a>
+### `semanticTokenModifiers map[string]bool`
+
+**This setting is experimental and may be deleted.**
+
+semanticTokenModifiers configures the semantic token modifiers. It allows
+disabling modifiers by setting each value to false.
+By default, all modifiers are enabled.
+
+Default: `{}`.
 
 <a id='completion'></a>
 ## Completion
@@ -330,10 +358,17 @@ Default: `false`.
 <a id='annotations'></a>
 ### `annotations map[enum]bool`
 
-**This setting is experimental and may be deleted.**
+annotations specifies the various kinds of compiler
+optimization details that should be reported as diagnostics
+when enabled for a package by the "Toggle compiler
+optimization details" (`gopls.gc_details`) command.
 
-annotations specifies the various kinds of optimization diagnostics
-that should be reported by the gc_details command.
+(Some users care only about one kind of annotation in their
+profiling efforts. More importantly, in large packages, the
+number of annotations can sometimes overwhelm the user
+interface and exceed the per-file diagnostic limit.)
+
+TODO(adonovan): rename this field to CompilerOptDetail.
 
 Each enum must be one of:
 
@@ -410,17 +445,16 @@ Default: `true`.
 ### `hoverKind enum`
 
 hoverKind controls the information that appears in the hover text.
-SingleLine and Structured are intended for use only by authors of editor plugins.
+SingleLine is intended for use only by authors of editor plugins.
 
 Must be one of:
 
 * `"FullDocumentation"`
 * `"NoDocumentation"`
 * `"SingleLine"`
-* `"Structured"` is an experimental setting that returns a structured hover format.
-This format separates the signature from the documentation, so that the client
-can do more manipulation of these fields.\
-This should only be used by clients that support this behavior.
+* `"Structured"` is a misguided experimental setting that returns a JSON
+hover format. This setting should not be used, as it will be removed in a
+future release of gopls.
 * `"SynopsisDocumentation"`
 
 Default: `"FullDocumentation"`.

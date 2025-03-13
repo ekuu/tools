@@ -12,7 +12,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -28,10 +27,12 @@ import (
 	"golang.org/x/tools/gopls/internal/lsprpc"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/protocol/command"
+	"golang.org/x/tools/gopls/internal/protocol/semtok"
 	"golang.org/x/tools/gopls/internal/server"
 	"golang.org/x/tools/gopls/internal/settings"
 	"golang.org/x/tools/gopls/internal/util/browser"
 	bugpkg "golang.org/x/tools/gopls/internal/util/bug"
+	"golang.org/x/tools/gopls/internal/util/moreslices"
 	"golang.org/x/tools/internal/diff"
 	"golang.org/x/tools/internal/jsonrpc2"
 	"golang.org/x/tools/internal/tool"
@@ -61,9 +62,6 @@ type Application struct {
 
 	// VeryVerbose enables a higher level of verbosity in logging output.
 	VeryVerbose bool `flag:"vv,veryverbose" help:"very verbose output"`
-
-	// Control ocagent export of telemetry
-	OCAgent string `flag:"ocagent" help:"the address of the ocagent (e.g. http://localhost:55678), or off"`
 
 	// PrepareOptions is called to update the options when a new view is built.
 	// It is primarily to allow the behavior of gopls to be modified by hooks.
@@ -97,8 +95,6 @@ func (app *Application) verbose() bool {
 // New returns a new Application ready to run.
 func New() *Application {
 	app := &Application{
-		OCAgent: "off", //TODO: Remove this line to default the exporter to on
-
 		Serve: Serve{
 			RemoteListenTimeout: 1 * time.Minute,
 		},
@@ -237,7 +233,7 @@ func (app *Application) Run(ctx context.Context, args ...string) error {
 	// executable, and immediately runs a gc.
 	filecache.Start()
 
-	ctx = debug.WithInstance(ctx, app.OCAgent)
+	ctx = debug.WithInstance(ctx)
 	if len(args) == 0 {
 		s := flag.NewFlagSet(app.Name(), flag.ExitOnError)
 		return tool.Run(ctx, s, &app.Serve, args)
@@ -283,7 +279,7 @@ func (app *Application) internalCommands() []tool.Application {
 func (app *Application) featureCommands() []tool.Application {
 	return []tool.Application{
 		&callHierarchy{app: app},
-		&check{app: app},
+		&check{app: app, Severity: "warning"},
 		&codeaction{app: app},
 		&codelens{app: app},
 		&definition{app: app},
@@ -300,7 +296,7 @@ func (app *Application) featureCommands() []tool.Application {
 		&prepareRename{app: app},
 		&references{app: app},
 		&rename{app: app},
-		&semtok{app: app},
+		&semanticToken{app: app},
 		&signature{app: app},
 		&stats{app: app},
 		&symbols{app: app},
@@ -308,11 +304,6 @@ func (app *Application) featureCommands() []tool.Application {
 		&workspaceSymbol{app: app},
 	}
 }
-
-var (
-	internalMu          sync.Mutex
-	internalConnections = make(map[string]*connection)
-)
 
 // connect creates and initializes a new in-process gopls session.
 func (app *Application) connect(ctx context.Context) (*connection, error) {
@@ -323,7 +314,6 @@ func (app *Application) connect(ctx context.Context) (*connection, error) {
 		options := settings.DefaultOptions(app.options)
 		svr = server.New(cache.NewSession(ctx, cache.New(nil)), client, options)
 		ctx = protocol.WithClient(ctx, client)
-
 	} else {
 		// remote
 		netConn, err := lsprpc.ConnectToRemote(ctx, app.Remote)
@@ -363,17 +353,24 @@ func (c *connection) initialize(ctx context.Context, options func(*settings.Opti
 	params.Capabilities.TextDocument.SemanticTokens.Requests.Range = &protocol.Or_ClientSemanticTokensRequestOptions_range{Value: true}
 	//params.Capabilities.TextDocument.SemanticTokens.Requests.Range.Value = true
 	params.Capabilities.TextDocument.SemanticTokens.Requests.Full = &protocol.Or_ClientSemanticTokensRequestOptions_full{Value: true}
-	params.Capabilities.TextDocument.SemanticTokens.TokenTypes = protocol.SemanticTypes()
-	params.Capabilities.TextDocument.SemanticTokens.TokenModifiers = protocol.SemanticModifiers()
+	params.Capabilities.TextDocument.SemanticTokens.TokenTypes = moreslices.ConvertStrings[string](semtok.TokenTypes)
+	params.Capabilities.TextDocument.SemanticTokens.TokenModifiers = moreslices.ConvertStrings[string](semtok.TokenModifiers)
+	params.Capabilities.TextDocument.CodeAction = protocol.CodeActionClientCapabilities{
+		CodeActionLiteralSupport: protocol.ClientCodeActionLiteralOptions{
+			CodeActionKind: protocol.ClientCodeActionKindOptions{
+				ValueSet: []protocol.CodeActionKind{protocol.Empty}, // => all
+			},
+		},
+	}
 	params.Capabilities.Window.WorkDoneProgress = true
 
-	params.InitializationOptions = map[string]interface{}{
+	params.InitializationOptions = map[string]any{
 		"symbolMatcher": string(opts.SymbolMatcher),
 	}
-	if _, err := c.Server.Initialize(ctx, params); err != nil {
+	if c.initializeResult, err = c.Initialize(ctx, params); err != nil {
 		return err
 	}
-	if err := c.Server.Initialized(ctx, &protocol.InitializedParams{}); err != nil {
+	if err := c.Initialized(ctx, &protocol.InitializedParams{}); err != nil {
 		return err
 	}
 	return nil
@@ -382,37 +379,18 @@ func (c *connection) initialize(ctx context.Context, options func(*settings.Opti
 type connection struct {
 	protocol.Server
 	client *cmdClient
-}
-
-// registerProgressHandler registers a handler for progress notifications.
-// The caller must call unregister when the handler is no longer needed.
-func (cli *cmdClient) registerProgressHandler(handler func(*protocol.ProgressParams)) (token protocol.ProgressToken, unregister func()) {
-	token = fmt.Sprintf("tok%d", rand.Uint64())
-
-	// register
-	cli.progressHandlersMu.Lock()
-	if cli.progressHandlers == nil {
-		cli.progressHandlers = make(map[protocol.ProgressToken]func(*protocol.ProgressParams))
-	}
-	cli.progressHandlers[token] = handler
-	cli.progressHandlersMu.Unlock()
-
-	unregister = func() {
-		cli.progressHandlersMu.Lock()
-		delete(cli.progressHandlers, token)
-		cli.progressHandlersMu.Unlock()
-	}
-	return token, unregister
+	// initializeResult keep the initialize protocol response from server
+	// including server capabilities.
+	initializeResult *protocol.InitializeResult
 }
 
 // cmdClient defines the protocol.Client interface behavior of the gopls CLI tool.
 type cmdClient struct {
 	app *Application
 
-	progressHandlersMu sync.Mutex
-	progressHandlers   map[protocol.ProgressToken]func(*protocol.ProgressParams)
-	iwlToken           protocol.ProgressToken
-	iwlDone            chan struct{}
+	progressMu sync.Mutex
+	iwlToken   protocol.ProgressToken
+	iwlDone    chan struct{}
 
 	filesMu sync.Mutex // guards files map
 	files   map[protocol.DocumentURI]*cmdFile
@@ -439,6 +417,10 @@ func newConnection(server protocol.Server, client *cmdClient) *connection {
 		Server: server,
 		client: client,
 	}
+}
+
+func (c *cmdClient) TextDocumentContentRefresh(context.Context, *protocol.TextDocumentContentRefreshParams) error {
+	return nil
 }
 
 func (c *cmdClient) CodeLensRefresh(context.Context) error { return nil }
@@ -481,7 +463,7 @@ func (c *cmdClient) LogMessage(ctx context.Context, p *protocol.LogMessageParams
 	return nil
 }
 
-func (c *cmdClient) Event(ctx context.Context, t *interface{}) error { return nil }
+func (c *cmdClient) Event(ctx context.Context, t *any) error { return nil }
 
 func (c *cmdClient) RegisterCapability(ctx context.Context, p *protocol.RegistrationParams) error {
 	return nil
@@ -495,13 +477,13 @@ func (c *cmdClient) WorkspaceFolders(ctx context.Context) ([]protocol.WorkspaceF
 	return nil, nil
 }
 
-func (c *cmdClient) Configuration(ctx context.Context, p *protocol.ParamConfiguration) ([]interface{}, error) {
-	results := make([]interface{}, len(p.Items))
+func (c *cmdClient) Configuration(ctx context.Context, p *protocol.ParamConfiguration) ([]any, error) {
+	results := make([]any, len(p.Items))
 	for i, item := range p.Items {
 		if item.Section != "gopls" {
 			continue
 		}
-		m := map[string]interface{}{
+		m := map[string]any{
 			"analyses": map[string]any{
 				"fillreturns":    true,
 				"nonewvars":      true,
@@ -671,7 +653,7 @@ func (c *cmdClient) PublishDiagnostics(ctx context.Context, p *protocol.PublishD
 	// TODO(golang/go#60122): replace the gopls.diagnose_files
 	// command with support for textDocument/diagnostic,
 	// so that we don't need to do this de-duplication.
-	type key [6]interface{}
+	type key [6]any
 	seen := make(map[key]bool)
 	out := file.diagnostics[:0]
 	for _, d := range file.diagnostics {
@@ -691,41 +673,33 @@ func (c *cmdClient) PublishDiagnostics(ctx context.Context, p *protocol.PublishD
 }
 
 func (c *cmdClient) Progress(_ context.Context, params *protocol.ProgressParams) error {
-	token, ok := params.Token.(string)
-	if !ok {
+	if _, ok := params.Token.(string); !ok {
 		return fmt.Errorf("unexpected progress token: %[1]T %[1]v", params.Token)
 	}
 
-	c.progressHandlersMu.Lock()
-	handler := c.progressHandlers[token]
-	c.progressHandlersMu.Unlock()
-	if handler == nil {
-		handler = c.defaultProgressHandler
-	}
-	handler(params)
-	return nil
-}
-
-// defaultProgressHandler is the default handler of progress messages,
-// used during the initialize request.
-func (c *cmdClient) defaultProgressHandler(params *protocol.ProgressParams) {
 	switch v := params.Value.(type) {
 	case *protocol.WorkDoneProgressBegin:
 		if v.Title == server.DiagnosticWorkTitle(server.FromInitialWorkspaceLoad) {
-			c.progressHandlersMu.Lock()
+			c.progressMu.Lock()
 			c.iwlToken = params.Token
-			c.progressHandlersMu.Unlock()
+			c.progressMu.Unlock()
+		}
+
+	case *protocol.WorkDoneProgressReport:
+		if c.app.Verbose {
+			fmt.Fprintln(os.Stderr, v.Message)
 		}
 
 	case *protocol.WorkDoneProgressEnd:
-		c.progressHandlersMu.Lock()
+		c.progressMu.Lock()
 		iwlToken := c.iwlToken
-		c.progressHandlersMu.Unlock()
+		c.progressMu.Unlock()
 
 		if params.Token == iwlToken {
 			close(c.iwlDone)
 		}
 	}
+	return nil
 }
 
 func (c *cmdClient) ShowDocument(ctx context.Context, params *protocol.ShowDocumentParams) (*protocol.ShowDocumentResult, error) {
@@ -788,19 +762,31 @@ func (c *cmdClient) openFile(uri protocol.DocumentURI) *cmdFile {
 	return c.getFile(uri)
 }
 
-// TODO(adonovan): provide convenience helpers to:
-// - map a (URI, protocol.Range) to a MappedRange;
-// - parse a command-line argument to a MappedRange.
 func (c *connection) openFile(ctx context.Context, uri protocol.DocumentURI) (*cmdFile, error) {
 	file := c.client.openFile(uri)
 	if file.err != nil {
 		return nil, file.err
 	}
 
+	// Choose language ID from file extension.
+	var langID protocol.LanguageKind // "" eventually maps to file.UnknownKind
+	switch filepath.Ext(uri.Path()) {
+	case ".go":
+		langID = "go"
+	case ".mod":
+		langID = "go.mod"
+	case ".sum":
+		langID = "go.sum"
+	case ".work":
+		langID = "go.work"
+	case ".s":
+		langID = "go.s"
+	}
+
 	p := &protocol.DidOpenTextDocumentParams{
 		TextDocument: protocol.TextDocumentItem{
 			URI:        uri,
-			LanguageID: "go",
+			LanguageID: langID,
 			Version:    1,
 			Text:       string(file.mapper.Content),
 		},
@@ -823,13 +809,10 @@ func (c *connection) semanticTokens(ctx context.Context, p *protocol.SemanticTok
 }
 
 func (c *connection) diagnoseFiles(ctx context.Context, files []protocol.DocumentURI) error {
-	cmd, err := command.NewDiagnoseFilesCommand("Diagnose files", command.DiagnoseFilesArgs{
+	cmd := command.NewDiagnoseFilesCommand("Diagnose files", command.DiagnoseFilesArgs{
 		Files: files,
 	})
-	if err != nil {
-		return err
-	}
-	_, err = c.executeCommand(ctx, &cmd)
+	_, err := c.executeCommand(ctx, cmd)
 	return err
 }
 

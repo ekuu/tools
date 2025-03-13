@@ -12,23 +12,18 @@ import (
 	"go/types"
 	"regexp"
 	"strings"
+	"unicode"
 
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/protocol"
-	"golang.org/x/tools/gopls/internal/util/astutil"
 	"golang.org/x/tools/gopls/internal/util/bug"
-	"golang.org/x/tools/gopls/internal/util/safetoken"
 	"golang.org/x/tools/internal/tokeninternal"
 )
 
-// IsGenerated gets and reads the file denoted by uri and reports
-// whether it contains a "generated file" comment as described at
-// https://golang.org/s/generatedcode.
-//
-// TODO(adonovan): opt: this function does too much.
-// Move snapshot.ReadFile into the caller (most of which have already done it).
+// IsGenerated reads and parses the header of the file denoted by uri
+// and reports whether it [ast.IsGenerated].
 func IsGenerated(ctx context.Context, snapshot *cache.Snapshot, uri protocol.DocumentURI) bool {
 	fh, err := snapshot.ReadFile(ctx, uri)
 	if err != nil {
@@ -38,17 +33,7 @@ func IsGenerated(ctx context.Context, snapshot *cache.Snapshot, uri protocol.Doc
 	if err != nil {
 		return false
 	}
-	for _, commentGroup := range pgf.File.Comments {
-		for _, comment := range commentGroup.List {
-			if matched := generatedRx.MatchString(comment.Text); matched {
-				// Check if comment is at the beginning of the line in source.
-				if safetoken.Position(pgf.Tok, comment.Slash).Column == 1 {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	return ast.IsGenerated(pgf.File)
 }
 
 // adjustedObjEnd returns the end position of obj, possibly modified for
@@ -75,11 +60,6 @@ func adjustedObjEnd(obj types.Object) token.Pos {
 	}
 	return obj.Pos() + token.Pos(nameLen)
 }
-
-// Matches cgo generated comment as well as the proposed standard:
-//
-//	https://golang.org/s/generatedcode
-var generatedRx = regexp.MustCompile(`// .*DO NOT EDIT\.?`)
 
 // FormatNode returns the "pretty-print" output for an ast node.
 func FormatNode(fset *token.FileSet, n ast.Node) string {
@@ -127,28 +107,6 @@ func findFileInDeps(s metadata.Source, mp *metadata.Package, uri protocol.Docume
 		return nil
 	}
 	return search(mp)
-}
-
-// CollectScopes returns all scopes in an ast path, ordered as innermost scope
-// first.
-func CollectScopes(info *types.Info, path []ast.Node, pos token.Pos) []*types.Scope {
-	// scopes[i], where i<len(path), is the possibly nil Scope of path[i].
-	var scopes []*types.Scope
-	for _, n := range path {
-		// Include *FuncType scope if pos is inside the function body.
-		switch node := n.(type) {
-		case *ast.FuncDecl:
-			if node.Body != nil && astutil.NodeContains(node.Body, pos) {
-				n = node.Type
-			}
-		case *ast.FuncLit:
-			if node.Body != nil && astutil.NodeContains(node.Body, pos) {
-				n = node.Type
-			}
-		}
-		scopes = append(scopes, info.Scopes[n])
-	}
-	return scopes
 }
 
 // requalifier returns a function that re-qualifies identifiers and qualified
@@ -362,4 +320,85 @@ func btoi(b bool) int {
 	} else {
 		return 0
 	}
+}
+
+// boolCompare is a comparison function for booleans, returning -1 if x < y, 0
+// if x == y, and 1 if x > y, where false < true.
+func boolCompare(x, y bool) int {
+	return btoi(x) - btoi(y)
+}
+
+// AbbreviateVarName returns an abbreviated var name based on the given full
+// name (which may be a type name, for example).
+//
+// See the simple heuristics documented in line.
+func AbbreviateVarName(s string) string {
+	var (
+		b            strings.Builder
+		useNextUpper bool
+	)
+	for i, r := range s {
+		// Stop if we encounter a non-identifier rune.
+		if !unicode.IsLetter(r) && !unicode.IsNumber(r) {
+			break
+		}
+
+		// Otherwise, take the first letter from word boundaries, assuming
+		// camelCase.
+		if i == 0 {
+			b.WriteRune(unicode.ToLower(r))
+		}
+
+		if unicode.IsUpper(r) {
+			if useNextUpper {
+				b.WriteRune(unicode.ToLower(r))
+				useNextUpper = false
+			}
+		} else {
+			useNextUpper = true
+		}
+	}
+	return b.String()
+}
+
+// copyrightComment returns the copyright comment group from the input file, or
+// nil if not found.
+func copyrightComment(file *ast.File) *ast.CommentGroup {
+	if len(file.Comments) == 0 {
+		return nil
+	}
+
+	// Copyright should appear before package decl and must be the first
+	// comment group.
+	if c := file.Comments[0]; c.Pos() < file.Package && c != file.Doc &&
+		!isDirective(c.List[0].Text) &&
+		strings.Contains(strings.ToLower(c.List[0].Text), "copyright") {
+		return c
+	}
+
+	return nil
+}
+
+var buildConstraintRe = regexp.MustCompile(`^//(go:build|\s*\+build).*`)
+
+// buildConstraintComment returns the build constraint comment from the input
+// file.
+// Returns nil if not found.
+func buildConstraintComment(file *ast.File) *ast.Comment {
+	for _, cg := range file.Comments {
+		// In Go files a build constraint must appear before the package clause.
+		// See https://pkg.go.dev/cmd/go#hdr-Build_constraints
+		if cg.Pos() > file.Package {
+			return nil
+		}
+
+		for _, c := range cg.List {
+			// TODO: use ast.ParseDirective when available (#68021).
+			if buildConstraintRe.MatchString(c.Text) {
+				return c
+			}
+		}
+	}
+
+	return nil
 }

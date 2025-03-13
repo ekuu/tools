@@ -12,18 +12,23 @@ import (
 	"go/token"
 	"go/types"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/tools/go/types/typeutil"
 	"golang.org/x/tools/gopls/internal/cache"
 	"golang.org/x/tools/gopls/internal/cache/metadata"
 	"golang.org/x/tools/gopls/internal/cache/methodsets"
+	"golang.org/x/tools/gopls/internal/cache/parsego"
 	"golang.org/x/tools/gopls/internal/file"
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/util/bug"
 	"golang.org/x/tools/gopls/internal/util/safetoken"
+	"golang.org/x/tools/internal/astutil/cursor"
+	"golang.org/x/tools/internal/astutil/edge"
 	"golang.org/x/tools/internal/event"
 )
 
@@ -73,9 +78,26 @@ func Implementation(ctx context.Context, snapshot *cache.Snapshot, f file.Handle
 }
 
 func implementations(ctx context.Context, snapshot *cache.Snapshot, fh file.Handle, pp protocol.Position) ([]protocol.Location, error) {
-	// First, find the object referenced at the cursor by type checking the
-	// current package.
-	obj, pkg, err := implementsObj(ctx, snapshot, fh.URI(), pp)
+	// Type check the current package.
+	pkg, pgf, err := NarrowestPackageForFile(ctx, snapshot, fh.URI())
+	if err != nil {
+		return nil, err
+	}
+	pos, err := pgf.PositionPos(pp)
+	if err != nil {
+		return nil, err
+	}
+
+	// Find implementations based on func signatures.
+	if locs, err := implFuncs(pkg, pgf, pos); err != errNotHandled {
+		return locs, err
+	}
+
+	// Find implementations based on method sets.
+
+	// First, find the object referenced at the cursor.
+	// The object may be declared in a different package.
+	obj, err := implementsObj(pkg, pgf, pos)
 	if err != nil {
 		return nil, err
 	}
@@ -120,19 +142,19 @@ func implementations(ctx context.Context, snapshot *cache.Snapshot, fh file.Hand
 	// (For methods, report the corresponding method names.)
 	//
 	// This logic is reused for local queries.
-	typeOrMethod := func(obj types.Object) (types.Type, string) {
+	typeOrMethod := func(obj types.Object) (types.Type, *types.Func) {
 		switch obj := obj.(type) {
 		case *types.TypeName:
-			return obj.Type(), ""
+			return obj.Type(), nil
 		case *types.Func:
 			// For methods, use the receiver type, which may be anonymous.
-			if recv := obj.Type().(*types.Signature).Recv(); recv != nil {
-				return recv.Type(), obj.Id()
+			if recv := obj.Signature().Recv(); recv != nil {
+				return recv.Type(), obj
 			}
 		}
-		return nil, ""
+		return nil, nil
 	}
-	queryType, queryMethodID := typeOrMethod(obj)
+	queryType, queryMethod := typeOrMethod(obj)
 	if queryType == nil {
 		return nil, bug.Errorf("%s is not a type or method", obj.Name()) // should have been handled by implementsObj
 	}
@@ -211,13 +233,13 @@ func implementations(ctx context.Context, snapshot *cache.Snapshot, fh file.Hand
 			if !ok {
 				return ErrNoIdentFound // checked earlier
 			}
-			// Shadow obj, queryType, and queryMethodID in this package.
+			// Shadow obj, queryType, and queryMethod in this package.
 			obj := declPkg.TypesInfo().ObjectOf(id) // may be nil
-			queryType, queryMethodID := typeOrMethod(obj)
+			queryType, queryMethod := typeOrMethod(obj)
 			if queryType == nil {
 				return fmt.Errorf("querying method sets in package %q: %v", pkgID, err)
 			}
-			localLocs, err := localImplementations(ctx, snapshot, declPkg, queryType, queryMethodID)
+			localLocs, err := localImplementations(ctx, snapshot, declPkg, queryType, queryMethod)
 			if err != nil {
 				return fmt.Errorf("querying local implementations %q: %v", pkgID, err)
 			}
@@ -231,7 +253,7 @@ func implementations(ctx context.Context, snapshot *cache.Snapshot, fh file.Hand
 	for _, index := range indexes {
 		index := index
 		group.Go(func() error {
-			for _, res := range index.Search(key, queryMethodID) {
+			for _, res := range index.Search(key, queryMethod) {
 				loc := res.Location
 				// Map offsets to protocol.Locations in parallel (may involve I/O).
 				group.Go(func() error {
@@ -271,21 +293,9 @@ func offsetToLocation(ctx context.Context, snapshot *cache.Snapshot, filename st
 	return m.OffsetLocation(start, end)
 }
 
-// implementsObj returns the object to query for implementations, which is a
-// type name or method.
-//
-// The returned Package is the narrowest package containing ppos, which is the
-// package using the resulting obj but not necessarily the declaring package.
-func implementsObj(ctx context.Context, snapshot *cache.Snapshot, uri protocol.DocumentURI, ppos protocol.Position) (types.Object, *cache.Package, error) {
-	pkg, pgf, err := NarrowestPackageForFile(ctx, snapshot, uri)
-	if err != nil {
-		return nil, nil, err
-	}
-	pos, err := pgf.PositionPos(ppos)
-	if err != nil {
-		return nil, nil, err
-	}
-
+// implementsObj returns the object to query for implementations,
+// which is a type name or method.
+func implementsObj(pkg *cache.Package, pgf *parsego.File, pos token.Pos) (types.Object, error) {
 	// This function inherits the limitation of its predecessor in
 	// requiring the selection to be an identifier (of a type or
 	// method). But there's no fundamental reason why one could
@@ -298,11 +308,11 @@ func implementsObj(ctx context.Context, snapshot *cache.Snapshot, uri protocol.D
 	// TODO(adonovan): simplify: use objectsAt?
 	path := pathEnclosingObjNode(pgf.File, pos)
 	if path == nil {
-		return nil, nil, ErrNoIdentFound
+		return nil, ErrNoIdentFound
 	}
 	id, ok := path[0].(*ast.Ident)
 	if !ok {
-		return nil, nil, ErrNoIdentFound
+		return nil, ErrNoIdentFound
 	}
 
 	// Is the object a type or method? Reject other kinds.
@@ -317,73 +327,73 @@ func implementsObj(ctx context.Context, snapshot *cache.Snapshot, uri protocol.D
 	case *types.TypeName:
 		// ok
 	case *types.Func:
-		if obj.Type().(*types.Signature).Recv() == nil {
-			return nil, nil, fmt.Errorf("%s is a function, not a method", id.Name)
+		if obj.Signature().Recv() == nil {
+			return nil, fmt.Errorf("%s is a function, not a method (query at 'func' token to find matching signatures)", id.Name)
 		}
 	case nil:
-		return nil, nil, fmt.Errorf("%s denotes unknown object", id.Name)
+		return nil, fmt.Errorf("%s denotes unknown object", id.Name)
 	default:
 		// e.g. *types.Var -> "var".
 		kind := strings.ToLower(strings.TrimPrefix(reflect.TypeOf(obj).String(), "*types."))
-		return nil, nil, fmt.Errorf("%s is a %s, not a type", id.Name, kind)
+		// TODO(adonovan): improve upon "nil is a nil, not a type".
+		return nil, fmt.Errorf("%s is a %s, not a type", id.Name, kind)
 	}
 
-	return obj, pkg, nil
+	return obj, nil
 }
 
 // localImplementations searches within pkg for declarations of all
 // types that are assignable to/from the query type, and returns a new
 // unordered array of their locations.
 //
-// If methodID is non-empty, the function instead returns the location
+// If method is non-nil, the function instead returns the location
 // of each type's method (if any) of that ID.
 //
 // ("Local" refers to the search within the same package, but this
 // function's results may include type declarations that are local to
 // a function body. The global search index excludes such types
 // because reliably naming such types is hard.)
-func localImplementations(ctx context.Context, snapshot *cache.Snapshot, pkg *cache.Package, queryType types.Type, methodID string) ([]protocol.Location, error) {
+func localImplementations(ctx context.Context, snapshot *cache.Snapshot, pkg *cache.Package, queryType types.Type, method *types.Func) ([]protocol.Location, error) {
 	queryType = methodsets.EnsurePointer(queryType)
+
+	var msets typeutil.MethodSetCache
 
 	// Scan through all type declarations in the syntax.
 	var locs []protocol.Location
 	var methodLocs []methodsets.Location
 	for _, pgf := range pkg.CompiledGoFiles() {
-		ast.Inspect(pgf.File, func(n ast.Node) bool {
-			spec, ok := n.(*ast.TypeSpec)
-			if !ok {
-				return true // not a type declaration
-			}
+		for cur := range pgf.Cursor.Preorder((*ast.TypeSpec)(nil)) {
+			spec := cur.Node().(*ast.TypeSpec)
 			def := pkg.TypesInfo().Defs[spec.Name]
 			if def == nil {
-				return true // "can't happen" for types
+				continue // "can't happen" for types
 			}
 			if def.(*types.TypeName).IsAlias() {
-				return true // skip type aliases to avoid duplicate reporting
+				continue // skip type aliases to avoid duplicate reporting
 			}
 			candidateType := methodsets.EnsurePointer(def.Type())
 
 			// The historical behavior enshrined by this
 			// function rejects cases where both are
 			// (nontrivial) interface types?
-			// That seems like useful information.
+			// That seems like useful information; see #68641.
 			// TODO(adonovan): UX: report I/I pairs too?
 			// The same question appears in the global algorithm (methodsets).
-			if !concreteImplementsIntf(candidateType, queryType) {
-				return true // not assignable
+			if !concreteImplementsIntf(&msets, candidateType, queryType) {
+				continue // not assignable
 			}
 
 			// Ignore types with empty method sets.
 			// (No point reporting that every type satisfies 'any'.)
-			mset := types.NewMethodSet(candidateType)
+			mset := msets.MethodSet(candidateType)
 			if mset.Len() == 0 {
-				return true
+				continue
 			}
 
-			if methodID == "" {
+			if method == nil {
 				// Found matching type.
 				locs = append(locs, mustLocation(pgf, spec.Name))
-				return true
+				continue
 			}
 
 			// Find corresponding method.
@@ -393,19 +403,18 @@ func localImplementations(ctx context.Context, snapshot *cache.Snapshot, pkg *ca
 			// We could recursively search pkg.Imports for it,
 			// but it's easier to walk the method set.
 			for i := 0; i < mset.Len(); i++ {
-				method := mset.At(i).Obj()
-				if method.Id() == methodID {
-					posn := safetoken.StartPosition(pkg.FileSet(), method.Pos())
+				m := mset.At(i).Obj()
+				if m.Id() == method.Id() {
+					posn := safetoken.StartPosition(pkg.FileSet(), m.Pos())
 					methodLocs = append(methodLocs, methodsets.Location{
 						Filename: posn.Filename,
 						Start:    posn.Offset,
-						End:      posn.Offset + len(method.Name()),
+						End:      posn.Offset + len(m.Name()),
 					})
 					break
 				}
 			}
-			return true
-		})
+		}
 	}
 
 	// Finally convert method positions to protocol form by reading the files.
@@ -449,28 +458,173 @@ func errorLocation(ctx context.Context, snapshot *cache.Snapshot) (protocol.Loca
 	return protocol.Location{}, fmt.Errorf("built-in error type not found")
 }
 
-// concreteImplementsIntf returns true if a is an interface type implemented by
-// concrete type b, or vice versa.
-func concreteImplementsIntf(a, b types.Type) bool {
-	aIsIntf, bIsIntf := types.IsInterface(a), types.IsInterface(b)
+// concreteImplementsIntf reports whether x is an interface type
+// implemented by concrete type y, or vice versa.
+//
+// If one or both types are generic, the result indicates whether the
+// interface may be implemented under some instantiation.
+func concreteImplementsIntf(msets *typeutil.MethodSetCache, x, y types.Type) bool {
+	xiface := types.IsInterface(x)
+	yiface := types.IsInterface(y)
 
 	// Make sure exactly one is an interface type.
-	if aIsIntf == bIsIntf {
+	// TODO(adonovan): rescind this policy choice and report
+	// I/I relationships. See CL 619719 + issue #68641.
+	if xiface == yiface {
 		return false
 	}
 
-	// Rearrange if needed so "a" is the concrete type.
-	if aIsIntf {
-		a, b = b, a
+	// Rearrange if needed so x is the concrete type.
+	if xiface {
+		x, y = y, x
+	}
+	// Inv: y is an interface type.
+
+	// For each interface method of y, check that x has it too.
+	// It is not necessary to compute x's complete method set.
+	//
+	// If y is a constraint interface (!y.IsMethodSet()), we
+	// ignore non-interface terms, leading to occasional spurious
+	// matches. We could in future filter based on them, but it
+	// would lead to divergence with the global (fingerprint-based)
+	// algorithm, which operates only on methodsets.
+	ymset := msets.MethodSet(y)
+	for i := range ymset.Len() {
+		ym := ymset.At(i).Obj().(*types.Func)
+
+		xobj, _, _ := types.LookupFieldOrMethod(x, false, ym.Pkg(), ym.Name())
+		xm, ok := xobj.(*types.Func)
+		if !ok {
+			return false // x lacks a method of y
+		}
+		if !unify(xm.Signature(), ym.Signature()) {
+			return false // signatures do not match
+		}
+	}
+	return true // all methods found
+}
+
+// unify reports whether the types of x and y match, allowing free
+// type parameters to stand for anything at all, without regard to
+// consistency of substitutions.
+//
+// TODO(adonovan): implement proper unification (#63982), finding the
+// most general unifier across all the interface methods.
+//
+// See also: unify in cache/methodsets/fingerprint, which uses a
+// similar ersatz unification approach on type fingerprints, for
+// the global index.
+func unify(x, y types.Type) bool {
+	x = types.Unalias(x)
+	y = types.Unalias(y)
+
+	// For now, allow a type parameter to match anything,
+	// without regard to consistency of substitutions.
+	if is[*types.TypeParam](x) || is[*types.TypeParam](y) {
+		return true
 	}
 
-	// TODO(adonovan): this should really use GenericAssignableTo
-	// to report (e.g.) "ArrayList[T] implements List[T]", but
-	// GenericAssignableTo doesn't work correctly on pointers to
-	// generic named types. Thus the legacy implementation and the
-	// "local" part of implementations fail to report generics.
-	// The global algorithm based on subsets does the right thing.
-	return types.AssignableTo(a, b)
+	if reflect.TypeOf(x) != reflect.TypeOf(y) {
+		return false // mismatched types
+	}
+
+	switch x := x.(type) {
+	case *types.Array:
+		y := y.(*types.Array)
+		return x.Len() == y.Len() &&
+			unify(x.Elem(), y.Elem())
+
+	case *types.Basic:
+		y := y.(*types.Basic)
+		return x.Kind() == y.Kind()
+
+	case *types.Chan:
+		y := y.(*types.Chan)
+		return x.Dir() == y.Dir() &&
+			unify(x.Elem(), y.Elem())
+
+	case *types.Interface:
+		y := y.(*types.Interface)
+		// TODO(adonovan): fix: for correctness, we must check
+		// that both interfaces have the same set of methods
+		// modulo type parameters, while avoiding the risk of
+		// unbounded interface recursion.
+		//
+		// Since non-empty interface literals are vanishingly
+		// rare in methods signatures, we ignore this for now.
+		// If more precision is needed we could compare method
+		// names and arities, still without full recursion.
+		return x.NumMethods() == y.NumMethods()
+
+	case *types.Map:
+		y := y.(*types.Map)
+		return unify(x.Key(), y.Key()) &&
+			unify(x.Elem(), y.Elem())
+
+	case *types.Named:
+		y := y.(*types.Named)
+		if x.Origin() != y.Origin() {
+			return false // different named types
+		}
+		xtargs := x.TypeArgs()
+		ytargs := y.TypeArgs()
+		if xtargs.Len() != ytargs.Len() {
+			return false // arity error (ill-typed)
+		}
+		for i := range xtargs.Len() {
+			if !unify(xtargs.At(i), ytargs.At(i)) {
+				return false // mismatched type args
+			}
+		}
+		return true
+
+	case *types.Pointer:
+		y := y.(*types.Pointer)
+		return unify(x.Elem(), y.Elem())
+
+	case *types.Signature:
+		y := y.(*types.Signature)
+		return x.Variadic() == y.Variadic() &&
+			unify(x.Params(), y.Params()) &&
+			unify(x.Results(), y.Results())
+
+	case *types.Slice:
+		y := y.(*types.Slice)
+		return unify(x.Elem(), y.Elem())
+
+	case *types.Struct:
+		y := y.(*types.Struct)
+		if x.NumFields() != y.NumFields() {
+			return false
+		}
+		for i := range x.NumFields() {
+			xf := x.Field(i)
+			yf := y.Field(i)
+			if xf.Embedded() != yf.Embedded() ||
+				xf.Name() != yf.Name() ||
+				x.Tag(i) != y.Tag(i) ||
+				!xf.Exported() && xf.Pkg() != yf.Pkg() ||
+				!unify(xf.Type(), yf.Type()) {
+				return false
+			}
+		}
+		return true
+
+	case *types.Tuple:
+		y := y.(*types.Tuple)
+		if x.Len() != y.Len() {
+			return false
+		}
+		for i := range x.Len() {
+			if !unify(x.At(i).Type(), y.At(i).Type()) {
+				return false
+			}
+		}
+		return true
+
+	default: // incl. *Union, *TypeParam
+		panic(fmt.Sprintf("unexpected Type %#v", x))
+	}
 }
 
 var (
@@ -535,9 +689,236 @@ func pathEnclosingObjNode(f *ast.File, pos token.Pos) []ast.Node {
 	}
 
 	// Reverse path so leaf is first element.
-	for i := 0; i < len(path)/2; i++ {
-		path[i], path[len(path)-1-i] = path[len(path)-1-i], path[i]
-	}
+	slices.Reverse(path)
 
 	return path
+}
+
+// --- Implementations based on signature types --
+
+// implFuncs finds Implementations based on func types.
+//
+// Just as an interface type abstracts a set of concrete methods, a
+// function type abstracts a set of concrete functions. Gopls provides
+// analogous operations for navigating from abstract to concrete and
+// back in the domain of function types.
+//
+// A single type (for example http.HandlerFunc) can have both an
+// underlying type of function (types.Signature) and have methods that
+// cause it to implement an interface. To avoid a confusing user
+// interface we want to separate the two operations so that the user
+// can unambiguously specify the query they want.
+//
+// So, whereas Implementations queries on interface types are usually
+// keyed by an identifier of a named type, Implementations queries on
+// function types are keyed by the "func" keyword, or by the "(" of a
+// call expression. The query relates two sets of locations:
+//
+//  1. the "func" token of each function declaration (FuncDecl or
+//     FuncLit). These are analogous to declarations of concrete
+//     methods.
+//
+//  2. uses of abstract functions:
+//
+//     (a) the "func" token of each FuncType that is not part of
+//     Func{Decl,Lit}. These are analogous to interface{...} types.
+//
+//     (b) the "(" paren of each dynamic call on a value of an
+//     abstract function type. These are analogous to references to
+//     interface method names, but no names are involved, which has
+//     historically made them hard to search for.
+//
+// An Implementations query on a location in set 1 returns set 2,
+// and vice versa.
+//
+// implFuncs returns errNotHandled to indicate that we should try the
+// regular method-sets algorithm.
+func implFuncs(pkg *cache.Package, pgf *parsego.File, pos token.Pos) ([]protocol.Location, error) {
+	curSel, ok := pgf.Cursor.FindPos(pos, pos)
+	if !ok {
+		return nil, fmt.Errorf("no code selected")
+	}
+
+	info := pkg.TypesInfo()
+
+	// Find innermost enclosing FuncType or CallExpr.
+	//
+	// We are looking for specific tokens (FuncType.Func and
+	// CallExpr.Lparen), but FindPos prefers an adjoining
+	// subexpression: given f(x) without additional spaces between
+	// tokens, FindPos always returns either f or x, never the
+	// CallExpr itself. Thus we must ascend the tree.
+	//
+	// Another subtlety: due to an edge case in go/ast, FindPos at
+	// FuncDecl.Type.Func does not return FuncDecl.Type, only the
+	// FuncDecl, because the orders of tree positions and tokens
+	// are inconsistent. Consequently, the ancestors for a "func"
+	// token of Func{Lit,Decl} do not include FuncType, hence the
+	// explicit cases below.
+	for _, cur := range curSel.Stack(nil) {
+		switch n := cur.Node().(type) {
+		case *ast.FuncDecl, *ast.FuncLit:
+			if inToken(n.Pos(), "func", pos) {
+				// Case 1: concrete function declaration.
+				// Report uses of corresponding function types.
+				switch n := n.(type) {
+				case *ast.FuncDecl:
+					return funcUses(pkg, info.Defs[n.Name].Type())
+				case *ast.FuncLit:
+					return funcUses(pkg, info.TypeOf(n.Type))
+				}
+			}
+
+		case *ast.FuncType:
+			if n.Func.IsValid() && inToken(n.Func, "func", pos) && !beneathFuncDef(cur) {
+				// Case 2a: function type.
+				// Report declarations of corresponding concrete functions.
+				return funcDefs(pkg, info.TypeOf(n))
+			}
+
+		case *ast.CallExpr:
+			if inToken(n.Lparen, "(", pos) {
+				t := dynamicFuncCallType(info, n)
+				if t == nil {
+					return nil, fmt.Errorf("not a dynamic function call")
+				}
+				// Case 2b: dynamic call of function value.
+				// Report declarations of corresponding concrete functions.
+				return funcDefs(pkg, t)
+			}
+		}
+	}
+
+	// It's probably a query of a named type or method.
+	// Fall back to the method-sets computation.
+	return nil, errNotHandled
+}
+
+var errNotHandled = errors.New("not handled")
+
+// funcUses returns all locations in the workspace that are dynamic
+// uses of the specified function type.
+func funcUses(pkg *cache.Package, t types.Type) ([]protocol.Location, error) {
+	var locs []protocol.Location
+
+	// local search
+	for _, pgf := range pkg.CompiledGoFiles() {
+		for cur := range pgf.Cursor.Preorder((*ast.CallExpr)(nil), (*ast.FuncType)(nil)) {
+			var pos, end token.Pos
+			var ftyp types.Type
+			switch n := cur.Node().(type) {
+			case *ast.CallExpr:
+				ftyp = dynamicFuncCallType(pkg.TypesInfo(), n)
+				pos, end = n.Lparen, n.Lparen+token.Pos(len("("))
+
+			case *ast.FuncType:
+				if !beneathFuncDef(cur) {
+					// func type (not def)
+					ftyp = pkg.TypesInfo().TypeOf(n)
+					pos, end = n.Func, n.Func+token.Pos(len("func"))
+				}
+			}
+			if ftyp == nil {
+				continue // missing type information
+			}
+			if unify(t, ftyp) {
+				loc, err := pgf.PosLocation(pos, end)
+				if err != nil {
+					return nil, err
+				}
+				locs = append(locs, loc)
+			}
+		}
+	}
+
+	// TODO(adonovan): implement global search
+
+	return locs, nil
+}
+
+// funcDefs returns all locations in the workspace that define
+// functions of the specified type.
+func funcDefs(pkg *cache.Package, t types.Type) ([]protocol.Location, error) {
+	var locs []protocol.Location
+
+	// local search
+	for _, pgf := range pkg.CompiledGoFiles() {
+		for curFn := range pgf.Cursor.Preorder((*ast.FuncDecl)(nil), (*ast.FuncLit)(nil)) {
+			fn := curFn.Node()
+			var ftyp types.Type
+			switch fn := fn.(type) {
+			case *ast.FuncDecl:
+				ftyp = pkg.TypesInfo().Defs[fn.Name].Type()
+			case *ast.FuncLit:
+				ftyp = pkg.TypesInfo().TypeOf(fn)
+			}
+			if ftyp == nil {
+				continue // missing type information
+			}
+			if unify(t, ftyp) {
+				pos := fn.Pos()
+				loc, err := pgf.PosLocation(pos, pos+token.Pos(len("func")))
+				if err != nil {
+					return nil, err
+				}
+				locs = append(locs, loc)
+			}
+		}
+	}
+
+	// TODO(adonovan): implement global search, by analogy with
+	// methodsets algorithm.
+	//
+	// One optimization: if any signature type has free package
+	// names, look for matches only in packages among the rdeps of
+	// those packages.
+
+	return locs, nil
+}
+
+// beneathFuncDef reports whether the specified FuncType cursor is a
+// child of Func{Decl,Lit}.
+func beneathFuncDef(cur cursor.Cursor) bool {
+	ek, _ := cur.Edge()
+	switch ek {
+	case edge.FuncDecl_Type, edge.FuncLit_Type:
+		return true
+	}
+	return false
+}
+
+// dynamicFuncCallType reports whether call is a dynamic (non-method) function call.
+// If so, it returns the function type, otherwise nil.
+//
+// Tested via ../test/marker/testdata/implementation/signature.txt.
+func dynamicFuncCallType(info *types.Info, call *ast.CallExpr) types.Type {
+	fun := ast.Unparen(call.Fun)
+	tv := info.Types[fun]
+
+	// Reject conversion, or call to built-in.
+	if !tv.IsValue() {
+		return nil
+	}
+
+	// Reject call to named func/method.
+	if id, ok := fun.(*ast.Ident); ok && is[*types.Func](info.Uses[id]) {
+		return nil
+	}
+
+	// Reject method selections (T.method() or x.method())
+	if sel, ok := fun.(*ast.SelectorExpr); ok {
+		seln, ok := info.Selections[sel]
+		if !ok || seln.Kind() != types.FieldVal {
+			return nil
+		}
+	}
+
+	// TODO(adonovan): consider x() where x : TypeParam.
+	return tv.Type.Underlying() // e.g. x() or x.field()
+}
+
+// inToken reports whether pos is within the token of
+// the specified position and string.
+func inToken(tokPos token.Pos, tokStr string, pos token.Pos) bool {
+	return tokPos <= pos && pos <= tokPos+token.Pos(len(tokStr))
 }

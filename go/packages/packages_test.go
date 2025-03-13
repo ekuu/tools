@@ -23,12 +23,16 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"golang.org/x/tools/go/packages"
-	"golang.org/x/tools/go/packages/packagestest"
 	"golang.org/x/tools/internal/packagesinternal"
+	"golang.org/x/tools/internal/packagestest"
 	"golang.org/x/tools/internal/testenv"
+	"golang.org/x/tools/internal/testfiles"
+	"golang.org/x/tools/txtar"
 )
 
 // testCtx is canceled when the test binary is about to time out.
@@ -125,7 +129,7 @@ func TestLoadImportsGraph(t *testing.T) { testAllOrModulesParallel(t, testLoadIm
 func testLoadImportsGraph(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go":             `package a; const A = 1`,
 			"b/b.go":             `package b; import ("golang.org/fake/a"; _ "container/list"); var B = a.A`,
 			"c/c.go":             `package c; import (_ "golang.org/fake/b"; _ "unsafe")`,
@@ -301,7 +305,7 @@ func TestLoadImportsTestVariants(t *testing.T) {
 func testLoadImportsTestVariants(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go":       `package a; import _ "golang.org/fake/b"`,
 			"b/b.go":       `package b`,
 			"b/b_test.go":  `package b`,
@@ -342,11 +346,11 @@ func TestLoadAbsolutePath(t *testing.T) {
 
 	exported := packagestest.Export(t, packagestest.GOPATH, []packagestest.Module{{
 		Name: "golang.org/gopatha",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a`,
 		}}, {
 		Name: "golang.org/gopathb",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"b/b.go": `package b`,
 		}}})
 	defer exported.Cleanup()
@@ -377,7 +381,7 @@ func TestLoadArgumentListIsNotTooLong(t *testing.T) {
 	argMax := 1_000_000
 	exported := packagestest.Export(t, packagestest.GOPATH, []packagestest.Module{{
 		Name: "golang.org/mod",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"main.go": `package main"`,
 		}}})
 	defer exported.Cleanup()
@@ -398,7 +402,7 @@ func TestVendorImports(t *testing.T) {
 
 	exported := packagestest.Export(t, packagestest.GOPATH, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go":          `package a; import _ "b"; import _ "golang.org/fake/c";`,
 			"a/vendor/b/b.go": `package b; import _ "golang.org/fake/c"`,
 			"c/c.go":          `package c; import _ "b"`,
@@ -459,7 +463,7 @@ func TestConfigDir(t *testing.T) { testAllOrModulesParallel(t, testConfigDir) }
 func testConfigDir(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go":   `package a; const Name = "a" `,
 			"a/b/b.go": `package b; const Name = "a/b"`,
 			"b/b.go":   `package b; const Name = "b"`,
@@ -507,11 +511,6 @@ func testConfigDir(t *testing.T, exporter packagestest.Exporter) {
 				test.dir, test.pattern, got, test.want)
 		}
 		if fails != test.fails {
-			// TODO: remove when go#28023 is fixed
-			if test.fails && strings.HasPrefix(test.pattern, "./") && exporter == packagestest.Modules {
-				// Currently go list in module mode does not handle missing directories correctly.
-				continue
-			}
 			t.Errorf("dir %q, pattern %q: error %v, want %v",
 				test.dir, test.pattern, fails, test.fails)
 		}
@@ -523,7 +522,7 @@ func testConfigFlags(t *testing.T, exporter packagestest.Exporter) {
 	// Test satisfying +build line tags, with -tags flag.
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			// package a
 			"a/a.go": `package a; import _ "golang.org/fake/a/b"`,
 			"a/b.go": `// +build tag
@@ -588,7 +587,7 @@ func testLoadTypes(t *testing.T, exporter packagestest.Exporter) {
 
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import "golang.org/fake/b"; import "golang.org/fake/c"; const A = "a" + b.B + c.C`,
 			"b/b.go": `package b; const B = "b"`,
 			"c/c.go": `package c; const C = "c" + 1`,
@@ -641,7 +640,7 @@ func TestLoadTypesBits(t *testing.T) { testAllOrModulesParallel(t, testLoadTypes
 func testLoadTypesBits(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import "golang.org/fake/b"; const A = "a" + b.B`,
 			"b/b.go": `package b; import "golang.org/fake/c"; const B = "b" + c.C`,
 			"c/c.go": `package c; import "golang.org/fake/d"; const C = "c" + d.D`,
@@ -717,7 +716,7 @@ func TestLoadSyntaxOK(t *testing.T) { testAllOrModulesParallel(t, testLoadSyntax
 func testLoadSyntaxOK(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import "golang.org/fake/b"; const A = "a" + b.B`,
 			"b/b.go": `package b; import "golang.org/fake/c"; const B = "b" + c.C`,
 			"c/c.go": `package c; import "golang.org/fake/d"; const C = "c" + d.D`,
@@ -808,7 +807,7 @@ func testLoadDiamondTypes(t *testing.T, exporter packagestest.Exporter) {
 	// We make a diamond dependency and check the type d.D is the same through both paths
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import ("golang.org/fake/b"; "golang.org/fake/c"); var _ = b.B == c.C`,
 			"b/b.go": `package b; import "golang.org/fake/d"; var B d.D`,
 			"c/c.go": `package c; import "golang.org/fake/d"; var C d.D`,
@@ -851,7 +850,7 @@ func testLoadSyntaxError(t *testing.T, exporter packagestest.Exporter) {
 	// should be IllTyped.
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import "golang.org/fake/b"; const A = "a" + b.B`,
 			"b/b.go": `package b; import "golang.org/fake/c"; const B = "b" + c.C`,
 			"c/c.go": `package c; import "golang.org/fake/d"; const C = "c" + d.D`,
@@ -923,7 +922,7 @@ func TestParseFileModifyAST(t *testing.T) { testAllOrModulesParallel(t, testPars
 func testParseFileModifyAST(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; const A = "a" `,
 		}}})
 	defer exported.Cleanup()
@@ -1011,7 +1010,7 @@ func testLoadAllSyntaxImportErrors(t *testing.T, exporter packagestest.Exporter)
 
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"unicycle/unicycle.go": `package unicycle; import _ "unicycle"`,
 			"bicycle1/bicycle1.go": `package bicycle1; import _ "bicycle2"`,
 			"bicycle2/bicycle2.go": `package bicycle2; import _ "bicycle1"`,
@@ -1091,7 +1090,7 @@ func TestAbsoluteFilenames(t *testing.T) { testAllOrModulesParallel(t, testAbsol
 func testAbsoluteFilenames(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go":          `package a; const A = 1`,
 			"b/b.go":          `package b; import ("golang.org/fake/a"; _ "errors"); var B = a.A`,
 			"b/vendor/a/a.go": `package a; const A = 1`,
@@ -1181,7 +1180,7 @@ func TestContains(t *testing.T) { testAllOrModulesParallel(t, testContains) }
 func testContains(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import "golang.org/fake/b"`,
 			"b/b.go": `package b; import "golang.org/fake/c"`,
 			"c/c.go": `package c`,
@@ -1220,7 +1219,7 @@ func testSizes(t *testing.T, exporter packagestest.Exporter) {
 
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import "unsafe"; const WordSize = 8*unsafe.Sizeof(int(0))`,
 		}}})
 	defer exported.Cleanup()
@@ -1258,7 +1257,7 @@ func TestNeedTypeSizesWithBadGOARCH(t *testing.T) {
 	testAllOrModulesParallel(t, func(t *testing.T, exporter packagestest.Exporter) {
 		exported := packagestest.Export(t, exporter, []packagestest.Module{{
 			Name:  "testdata",
-			Files: map[string]interface{}{"a/a.go": `package a`}}})
+			Files: map[string]any{"a/a.go": `package a`}}})
 		defer exported.Cleanup()
 
 		exported.Config.Mode = packages.NeedTypesSizes // or {,Info,Sizes}
@@ -1281,7 +1280,7 @@ func TestContainsFallbackSticks(t *testing.T) {
 func testContainsFallbackSticks(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import "golang.org/fake/b"`,
 			"b/b.go": `package b; import "golang.org/fake/c"`,
 			"c/c.go": `package c`,
@@ -1314,7 +1313,7 @@ func TestNoPatterns(t *testing.T) { testAllOrModulesParallel(t, testNoPatterns) 
 func testNoPatterns(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go":   `package a;`,
 			"a/b/b.go": `package b;`,
 		}}})
@@ -1337,7 +1336,7 @@ func testJSON(t *testing.T, exporter packagestest.Exporter) {
 	// TODO: add in some errors
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; const A = 1`,
 			"b/b.go": `package b; import "golang.org/fake/a"; var B = a.A`,
 			"c/c.go": `package c; import "golang.org/fake/b" ; var C = b.B`,
@@ -1504,7 +1503,7 @@ func TestPatternPassthrough(t *testing.T) { testAllOrModulesParallel(t, testPatt
 func testPatternPassthrough(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a;`,
 		}}})
 	defer exported.Cleanup()
@@ -1564,7 +1563,7 @@ EOF
 	}
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"bin/gopackagesdriver": driverScript,
 			"golist/golist.go":     "package golist",
 		}}})
@@ -1640,7 +1639,7 @@ func TestBasicXTest(t *testing.T) { testAllOrModulesParallel(t, testBasicXTest) 
 func testBasicXTest(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go":      `package a;`,
 			"a/a_test.go": `package a_test;`,
 		}}})
@@ -1658,7 +1657,7 @@ func TestErrorMissingFile(t *testing.T) { testAllOrModulesParallel(t, testErrorM
 func testErrorMissingFile(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a_test.go": `package a;`,
 		}}})
 	defer exported.Cleanup()
@@ -1686,11 +1685,11 @@ func TestReturnErrorWhenUsingNonGoFiles(t *testing.T) {
 func testReturnErrorWhenUsingNonGoFiles(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/gopatha",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a`,
 		}}, {
 		Name: "golang.org/gopathb",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"b/b.c": `package b`,
 		}}})
 	defer exported.Cleanup()
@@ -1714,7 +1713,7 @@ func TestReturnErrorWhenUsingGoFilesInMultipleDirectories(t *testing.T) {
 func testReturnErrorWhenUsingGoFilesInMultipleDirectories(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/gopatha",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a`,
 			"b/b.go": `package b`,
 		}}})
@@ -1746,7 +1745,7 @@ func TestReturnErrorForUnexpectedDirectoryLayout(t *testing.T) {
 func testReturnErrorForUnexpectedDirectoryLayout(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/gopatha",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/testdata/a.go": `package a; import _ "b"`,
 			"a/vendor/b/b.go": `package b; import _ "fmt"`,
 		}}})
@@ -1775,7 +1774,7 @@ func TestMissingDependency(t *testing.T) { testAllOrModulesParallel(t, testMissi
 func testMissingDependency(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import _ "this/package/doesnt/exist"`,
 		}}})
 	defer exported.Cleanup()
@@ -1797,7 +1796,7 @@ func TestAdHocContains(t *testing.T) { testAllOrModulesParallel(t, testAdHocCont
 func testAdHocContains(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a;`,
 		}}})
 	defer exported.Cleanup()
@@ -1840,7 +1839,7 @@ func testCgoNoCcompiler(t *testing.T, exporter packagestest.Exporter) {
 	testenv.NeedsTool(t, "cgo")
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a
 import "net/http"
 const A = http.MethodGet
@@ -1874,7 +1873,7 @@ func testCgoMissingFile(t *testing.T, exporter packagestest.Exporter) {
 	testenv.NeedsTool(t, "cgo")
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a
 
 // #include "foo.h"
@@ -1963,7 +1962,7 @@ func testCgoNoSyntax(t *testing.T, exporter packagestest.Exporter) {
 
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"c/c.go": `package c; import "C"`,
 		},
 	}})
@@ -2006,7 +2005,7 @@ func testCgoBadPkgConfig(t *testing.T, exporter packagestest.Exporter) {
 
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"c/c.go": `package c
 
 // #cgo pkg-config: --cflags --  foo
@@ -2075,7 +2074,7 @@ func TestIssue32814(t *testing.T) { testAllOrModulesParallel(t, testIssue32814) 
 func testIssue32814(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name:  "golang.org/fake",
-		Files: map[string]interface{}{}}})
+		Files: map[string]any{}}})
 	defer exported.Cleanup()
 
 	exported.Config.Mode = packages.NeedName | packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedTypesSizes
@@ -2104,7 +2103,7 @@ func TestLoadTypesInfoWithoutNeedDeps(t *testing.T) {
 func testLoadTypesInfoWithoutNeedDeps(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import _ "golang.org/fake/b"`,
 			"b/b.go": `package b`,
 		}}})
@@ -2131,7 +2130,7 @@ func TestLoadWithNeedDeps(t *testing.T) {
 func testLoadWithNeedDeps(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import _ "golang.org/fake/b"`,
 			"b/b.go": `package b; import _ "golang.org/fake/c"`,
 			"c/c.go": `package c`,
@@ -2175,7 +2174,7 @@ func TestImpliedLoadMode(t *testing.T) {
 func testImpliedLoadMode(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import _ "golang.org/fake/b"`,
 			"b/b.go": `package b`,
 		}}})
@@ -2244,7 +2243,7 @@ func TestMultiplePackageVersionsIssue36188(t *testing.T) {
 func testMultiplePackageVersionsIssue36188(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import _ "golang.org/fake/b"`,
 			"b/b.go": `package main`,
 		}}})
@@ -2280,59 +2279,71 @@ func TestLoadModeStrings(t *testing.T) {
 		},
 		{
 			packages.NeedName,
-			"LoadMode(NeedName)",
+			"NeedName",
 		},
 		{
 			packages.NeedFiles,
-			"LoadMode(NeedFiles)",
+			"NeedFiles",
 		},
 		{
 			packages.NeedCompiledGoFiles,
-			"LoadMode(NeedCompiledGoFiles)",
+			"NeedCompiledGoFiles",
 		},
 		{
 			packages.NeedImports,
-			"LoadMode(NeedImports)",
+			"NeedImports",
 		},
 		{
 			packages.NeedDeps,
-			"LoadMode(NeedDeps)",
+			"NeedDeps",
 		},
 		{
 			packages.NeedExportFile,
-			"LoadMode(NeedExportFile)",
+			"NeedExportFile",
 		},
 		{
 			packages.NeedTypes,
-			"LoadMode(NeedTypes)",
+			"NeedTypes",
 		},
 		{
 			packages.NeedSyntax,
-			"LoadMode(NeedSyntax)",
+			"NeedSyntax",
 		},
 		{
 			packages.NeedTypesInfo,
-			"LoadMode(NeedTypesInfo)",
+			"NeedTypesInfo",
 		},
 		{
 			packages.NeedTypesSizes,
-			"LoadMode(NeedTypesSizes)",
+			"NeedTypesSizes",
 		},
 		{
 			packages.NeedName | packages.NeedExportFile,
-			"LoadMode(NeedName|NeedExportFile)",
+			"(NeedName|NeedExportFile)",
+		},
+		{
+			packages.NeedForTest | packages.NeedTarget | packages.NeedEmbedFiles | packages.NeedEmbedPatterns,
+			"(NeedForTest|NeedEmbedFiles|NeedEmbedPatterns|NeedTarget)",
 		},
 		{
 			packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles | packages.NeedImports | packages.NeedDeps | packages.NeedExportFile | packages.NeedTypes | packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedTypesSizes,
-			"LoadMode(NeedName|NeedFiles|NeedCompiledGoFiles|NeedImports|NeedDeps|NeedExportFile|NeedTypes|NeedSyntax|NeedTypesInfo|NeedTypesSizes)",
+			"(NeedName|NeedFiles|NeedCompiledGoFiles|NeedImports|NeedDeps|NeedExportFile|NeedTypes|NeedSyntax|NeedTypesInfo|NeedTypesSizes)",
 		},
 		{
-			packages.NeedName | 8192,
-			"LoadMode(NeedName|Unknown)",
+			packages.NeedName | packages.NeedModule,
+			"(NeedName|NeedModule)",
 		},
 		{
-			4096,
-			"LoadMode(Unknown)",
+			packages.NeedName | 0x100000, // off the end (future use)
+			"(NeedName|0x100000)",
+		},
+		{
+			packages.NeedName | 0x400, // needInternalDepsErrors
+			"(NeedName|0x400)",
+		},
+		{
+			0x1000,
+			"LoadMode(0x1000)",
 		},
 	}
 
@@ -2352,7 +2363,7 @@ func TestCycleImportStack(t *testing.T) {
 func testCycleImportStack(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a; import _ "golang.org/fake/b"`,
 			"b/b.go": `package b; import _ "golang.org/fake/a"`,
 		}}})
@@ -2382,7 +2393,7 @@ func TestForTestField(t *testing.T) {
 func testForTestField(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go":      `package a; func hello() {};`,
 			"a/a_test.go": `package a; import "testing"; func TestA1(t *testing.T) {};`,
 			"a/x_test.go": `package a_test; import "testing"; func TestA2(t *testing.T) {};`,
@@ -2415,8 +2426,7 @@ func testForTestField(t *testing.T, exporter packagestest.Exporter) {
 		if !hasTestFile {
 			continue
 		}
-		got := packagesinternal.GetForTest(pkg)
-		if got != forTest {
+		if got := pkg.ForTest; got != forTest {
 			t.Errorf("expected %q, got %q", forTest, got)
 		}
 	}
@@ -2489,7 +2499,7 @@ func testIssue37098(t *testing.T, exporter packagestest.Exporter) {
 	// file.
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			// The "package" statement must be included for SWIG sources to
 			// be generated.
 			"a/a.go":      "package a",
@@ -2540,7 +2550,7 @@ func TestIssue56632(t *testing.T) {
 
 	exported := packagestest.Export(t, packagestest.GOPATH, []packagestest.Module{{
 		Name: "golang.org/issue56632",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a`,
 			"a/a_cgo.go": `package a
 
@@ -2583,7 +2593,7 @@ func testInvalidFilesInXTest(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{
 		{
 			Name: "golang.org/fake",
-			Files: map[string]interface{}{
+			Files: map[string]any{
 				"d/d.go":      `package d; import "net/http"; const d = http.MethodGet; func Get() string { return d; }`,
 				"d/d2.go":     ``, // invalid file
 				"d/d_test.go": `package d_test; import "testing"; import "golang.org/fake/d"; func TestD(t *testing.T) { d.Get(); }`,
@@ -2618,7 +2628,7 @@ func testTypecheckCgo(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{
 		{
 			Name: "golang.org/fake",
-			Files: map[string]interface{}{
+			Files: map[string]any{
 				"cgo/cgo.go": cgo,
 			},
 		},
@@ -2652,7 +2662,7 @@ func testIssue48226(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{
 		{
 			Name: "golang.org/fake/syntax",
-			Files: map[string]interface{}{
+			Files: map[string]any{
 				"syntax.go": `package test`,
 			},
 		},
@@ -2674,7 +2684,7 @@ func testIssue48226(t *testing.T, exporter packagestest.Exporter) {
 		t.Fatalf("package has errors: %v", pkg.Errors)
 	}
 
-	fname := pkg.Fset.File(pkg.Syntax[0].Pos()).Name()
+	fname := pkg.Fset.File(pkg.Syntax[0].FileStart).Name()
 	if filepath.Base(fname) != "syntax.go" {
 		t.Errorf("expected the package declaration position "+
 			"to resolve to \"syntax.go\", got %q instead", fname)
@@ -2687,7 +2697,7 @@ func TestModule(t *testing.T) {
 func testModule(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name:  "golang.org/fake",
-		Files: map[string]interface{}{"a/a.go": `package a`}}})
+		Files: map[string]any{"a/a.go": `package a`}}})
 	exported.Config.Mode = packages.NeedModule
 	rootDir := filepath.Dir(filepath.Dir(exported.File("golang.org/fake", "a/a.go")))
 
@@ -2736,7 +2746,7 @@ func testExternal_NotHandled(t *testing.T, exporter packagestest.Exporter) {
 
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"a/a.go": `package a`,
 			"empty_driver/main.go": `package main
 
@@ -2815,7 +2825,7 @@ func TestInvalidPackageName(t *testing.T) {
 func testInvalidPackageName(t *testing.T, exporter packagestest.Exporter) {
 	exported := packagestest.Export(t, exporter, []packagestest.Module{{
 		Name: "golang.org/fake",
-		Files: map[string]interface{}{
+		Files: map[string]any{
 			"main.go": `package default
 
 func main() {
@@ -2989,30 +2999,6 @@ func constant(p *packages.Package, name string) *types.Const {
 	return c.(*types.Const)
 }
 
-func copyAll(srcPath, dstPath string) error {
-	return filepath.Walk(srcPath, func(path string, info os.FileInfo, _ error) error {
-		if info.IsDir() {
-			return nil
-		}
-		contents, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(srcPath, path)
-		if err != nil {
-			return err
-		}
-		dstFilePath := strings.Replace(filepath.Join(dstPath, rel), "definitelynot_go.mod", "go.mod", -1)
-		if err := os.MkdirAll(filepath.Dir(dstFilePath), 0755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(dstFilePath, contents, 0644); err != nil {
-			return err
-		}
-		return nil
-	})
-}
-
 func TestExportFile(t *testing.T) {
 	// This used to trigger the log.Fatal in loadFromExportData.
 	// See go.dev/issue/45584.
@@ -3094,4 +3080,323 @@ func TestLoadOverlayGoMod(t *testing.T) {
 	if got != want {
 		t.Errorf("Load: got %s, want %v", got, want)
 	}
+}
+
+func overlayFS(overlay map[string][]byte) fstest.MapFS {
+	fs := make(fstest.MapFS)
+	for name, data := range overlay {
+		fs[name] = &fstest.MapFile{Data: data}
+	}
+	return fs
+}
+
+// TestIssue69606a tests when tools in $GOROOT/pkg/tool/$GOOS_$GOARCH are missing,
+// Load should return an error.
+func TestIssue69606a(t *testing.T) {
+	testenv.NeedsTool(t, "go")
+	overlay := overlayFS(map[string][]byte{
+		"io/io.go":         []byte("package io"),
+		"unsafe/unsafe.go": []byte("package unsafe"),
+	})
+	goroot := testfiles.CopyToTmp(t, overlay)
+
+	t.Logf("custom GOROOT: %s", goroot)
+
+	// load the std packages under a custom GOROOT
+	_, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedImports |
+			packages.NeedTypes,
+		Env: append(
+			os.Environ(),
+			"GO111MODULES=on",
+			"GOPATH=",
+			"GOWORK=off",
+			"GOPROXY=off",
+			fmt.Sprintf("GOROOT=%s", goroot)),
+	}, "std")
+
+	if err == nil {
+		t.Fatal("Expected to get an error because missing tool 'compile' but got a nil error")
+	}
+}
+
+// TestIssue69606b tests when loading std from a fake goroot without a unsafe package,
+// Load should return an error.
+func TestIssue69606b(t *testing.T) {
+	testenv.NeedsTool(t, "go")
+	overlay := overlayFS(map[string][]byte{
+		"io/io.go": []byte("package io"),
+	})
+	goroot := testfiles.CopyToTmp(t, overlay)
+
+	t.Logf("custom GOROOT: %s", goroot)
+
+	// load the std packages under a custom GOROOT
+	_, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedImports |
+			packages.NeedTypes,
+		Env: append(
+			os.Environ(),
+			"GO111MODULES=on",
+			"GOPATH=",
+			"GOWORK=off",
+			"GOPROXY=off",
+			fmt.Sprintf("GOROOT=%s", goroot)),
+	}, "std")
+
+	if err == nil {
+		t.Fatal("Expected to get an error because missing unsafe package but got a nil error")
+	}
+}
+
+// TestIssue70394 tests materializing an alias type defined in a package (m/a)
+// in another package (m/b) where the types for m/b are coming from the compiler,
+// e.g. `go list -compiled=true ... m/b`.
+func TestIssue70394(t *testing.T) {
+	testenv.NeedsGo1Point(t, 23)
+	testenv.NeedsTool(t, "go") // requires go list.
+	testenv.NeedsGoBuild(t)    // requires the compiler for export data.
+
+	t.Setenv("GODEBUG", "gotypesalias=1")
+
+	dir := t.TempDir()
+	overlay := map[string][]byte{
+		filepath.Join(dir, "go.mod"): []byte("module m"), // go version of the module does not matter.
+		filepath.Join(dir, "a/a.go"): []byte(`package a; type A = int32`),
+		filepath.Join(dir, "b/b.go"): []byte(`package b; import "m/a"; var V a.A`),
+	}
+	cfg := &packages.Config{
+		Dir:     dir,
+		Mode:    packages.NeedTypes, // just NeedsTypes allows for loading export data.
+		Overlay: overlay,
+		Env:     append(os.Environ(), "GOFLAGS=-mod=vendor", "GOWORK=off"),
+	}
+	pkgs, err := packages.Load(cfg, "m/b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if errs := packages.PrintErrors(pkgs); errs > 0 {
+		t.Fatalf("Got %d errors while loading packages.", errs)
+	}
+	if len(pkgs) != 1 {
+		t.Fatalf("Loaded %d packages. expected 1", len(pkgs))
+	}
+
+	pkg := pkgs[0]
+	scope := pkg.Types.Scope()
+	obj := scope.Lookup("V")
+	if obj == nil {
+		t.Fatalf("Failed to find object %q in package %q", "V", pkg)
+	}
+	if _, ok := obj.Type().(*types.Alias); !ok {
+		t.Errorf("Object %q has type %q. expected an alias", obj, obj.Type())
+	}
+}
+
+// TestLoadTypesInfoWithoutSyntaxOrTypes tests when NeedTypesInfo was set and NeedSyntax & NeedTypes were not,
+// Load should include the TypesInfo of packages properly
+func TestLoadTypesInfoWithoutSyntaxOrTypes(t *testing.T) {
+	testAllOrModulesParallel(t, testLoadTypesInfoWithoutSyntaxOrTypes)
+}
+
+func testLoadTypesInfoWithoutSyntaxOrTypes(t *testing.T, exporter packagestest.Exporter) {
+	exported := packagestest.Export(t, exporter, []packagestest.Module{{
+		Name: "golang.org/fake",
+		Files: map[string]any{
+			"a/a.go": `package a;
+
+func foo() int {
+	i := 0
+	s := "abc"
+	return i + len(s)
+}
+`,
+		}}})
+	defer exported.Cleanup()
+	exported.Config.Mode = packages.NeedTypesInfo
+
+	pkgs, err := packages.Load(exported.Config, "golang.org/fake/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// check if types info is present
+	if pkgs[0].TypesInfo == nil {
+		t.Errorf("expected types info to be present but got nil")
+	}
+}
+
+// TestDirAndForTest tests the new fields added as part of golang/go#38445.
+func TestDirAndForTest(t *testing.T) {
+	testenv.NeedsGoPackages(t)
+
+	dir := writeTree(t, `
+-- go.mod --
+module example.com
+
+go 1.18
+
+-- a/a.go --
+package a
+
+func Foo() int { return 1 }
+
+-- a/a_test.go --
+package a
+
+func Bar() int { return 2 }
+
+-- a/a_x_test.go --
+package a_test
+
+import (
+	"example.com/a"
+	"example.com/b"
+)
+
+func _() {
+	if got := a.Foo() + a.Bar() + b.Baz(); got != 6 {
+		panic("whoops")
+	}
+}
+
+-- b/b.go --
+package b
+
+import "example.com/a"
+
+func Baz() int { return 3 }
+
+func Foo() int { return a.Foo() }
+`)
+
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedForTest |
+			packages.NeedImports,
+		Dir:   dir,
+		Tests: true,
+	}, "./...")
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct{ Dir, ForTest string }
+	got := make(map[string]result)
+	packages.Visit(pkgs, nil, func(pkg *packages.Package) {
+		if strings.Contains(pkg.PkgPath, ".") { // ignore std
+			rel, err := filepath.Rel(dir, pkg.Dir)
+			if err != nil {
+				t.Errorf("Rel(%q, %q) failed: %v", dir, pkg.Dir, err)
+				return
+			}
+			got[pkg.ID] = result{
+				Dir:     rel,
+				ForTest: pkg.ForTest,
+			}
+		}
+	})
+	want := map[string]result{
+		"example.com/a":                           {"a", ""},
+		"example.com/a.test":                      {"a", ""},
+		"example.com/a [example.com/a.test]":      {"a", "example.com/a"}, // test variant
+		"example.com/a_test [example.com/a.test]": {"a", "example.com/a"}, // x_test
+		"example.com/b [example.com/a.test]":      {"b", "example.com/a"}, // intermediate test variant
+		"example.com/b":                           {"b", ""},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Load returned mismatching ForTest fields (ID->result -want +got):\n%s", diff)
+	}
+	t.Logf("Packages: %+v", pkgs)
+}
+
+// TestTarget tests the new field added as part of golang/go#38445.
+// The test uses GOPATH mode because non-main packages don't usually
+// have install targets in module mode.
+func TestTarget(t *testing.T) {
+	testenv.NeedsGoPackages(t)
+
+	dir := writeTree(t, `
+-- gopath/src/a/a.go --
+package a
+
+func Foo() {}
+-- gopath/src/b/b.go --
+package main
+
+import "a"
+
+func main() {
+	a.Foo()
+}
+`)
+	gopath := filepath.Join(dir, "gopath")
+
+	pkgs, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedTarget,
+		Env:  append(os.Environ(), "GOPATH="+gopath, "GO111MODULE=off"),
+	}, filepath.Join(gopath, "src", "..."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var goexe string
+	if runtime.GOOS == "windows" {
+		goexe = ".exe"
+	}
+	want := map[string]string{
+		"a": filepath.Join(gopath, "pkg", runtime.GOOS+"_"+runtime.GOARCH, "a.a"),
+		"b": filepath.Join(gopath, "bin", "b"+goexe),
+	}
+	got := make(map[string]string)
+	packages.Visit(pkgs, nil, func(pkg *packages.Package) {
+		got[pkg.PkgPath] = pkg.Target
+	})
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Load returned mismatching Target fields (pkgpath->target -want +got):\n%s", diff)
+	}
+	t.Logf("Packages: %+v", pkgs)
+}
+
+// TestMainPackagePathInModeTypes tests (*types.Package).Path() for
+// main packages in mode NeedTypes, a regression test for #70742, a
+// bug in cmd/compile's export data that caused them to appear as
+// "main". (The PkgPath field was always correct.)
+func TestMainPackagePathInModeTypes(t *testing.T) {
+	testenv.NeedsGoPackages(t)
+
+	cfg := &packages.Config{Mode: packages.NeedName | packages.NeedTypes}
+	pkgs, err := packages.Load(cfg, "cmd/go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := pkgs[0]
+	if p.PkgPath != "cmd/go" ||
+		p.Name != "main" ||
+		p.Types.Path() != "cmd/go" ||
+		p.Types.Name() != "main" {
+		t.Errorf("PkgPath=%q Name=%q Types.Path=%q Types.Name=%q; want (cmd/go, main) both times)",
+			p.PkgPath,
+			p.Name,
+			p.Types.Name(),
+			p.Types.Path())
+	}
+}
+
+func writeTree(t *testing.T, archive string) string {
+	root := t.TempDir()
+
+	for _, f := range txtar.Parse([]byte(archive)).Files {
+		filename := filepath.Join(root, f.Name)
+		if err := os.MkdirAll(filepath.Dir(filename), 0777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filename, f.Data, 0666); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
 }

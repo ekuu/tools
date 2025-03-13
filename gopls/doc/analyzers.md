@@ -290,6 +290,41 @@ Default: on.
 
 Package documentation: [framepointer](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/framepointer)
 
+<a id='gofix'></a>
+## `gofix`: apply fixes based on go:fix comment directives
+
+
+The gofix analyzer inlines functions and constants that are marked for inlining.
+
+Default: on.
+
+Package documentation: [gofix](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/gofix)
+
+<a id='hostport'></a>
+## `hostport`: check format of addresses passed to net.Dial
+
+
+This analyzer flags code that produce network address strings using
+fmt.Sprintf, as in this example:
+
+    addr := fmt.Sprintf("%s:%d", host, 12345) // "will not work with IPv6"
+    ...
+    conn, err := net.Dial("tcp", addr)       // "when passed to dial here"
+
+The analyzer suggests a fix to use the correct approach, a call to
+net.JoinHostPort:
+
+    addr := net.JoinHostPort(host, "12345")
+    ...
+    conn, err := net.Dial("tcp", addr)
+
+A similar diagnostic and fix are produced for a format string of "%s:%s".
+
+
+Default: on.
+
+Package documentation: [hostport](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/hostport)
+
 <a id='httpresponse'></a>
 ## `httpresponse`: check for mistakes using HTTP responses
 
@@ -428,13 +463,96 @@ Package documentation: [loopclosure](https://pkg.go.dev/golang.org/x/tools/go/an
 
 
 The cancellation function returned by context.WithCancel, WithTimeout,
-and WithDeadline must be called or the new context will remain live
-until its parent context is cancelled.
+WithDeadline and variants such as WithCancelCause must be called,
+or the new context will remain live until its parent context is cancelled.
 (The background context is never cancelled.)
 
 Default: on.
 
 Package documentation: [lostcancel](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/lostcancel)
+
+<a id='modernize'></a>
+## `modernize`: simplify code by using modern constructs
+
+
+This analyzer reports opportunities for simplifying and clarifying
+existing code by using more modern features of Go and its standard
+library.
+
+Each diagnostic provides a fix. Our intent is that these fixes may
+be safely applied en masse without changing the behavior of your
+program. In some cases the suggested fixes are imperfect and may
+lead to (for example) unused imports or unused local variables,
+causing build breakage. However, these problems are generally
+trivial to fix. We regard any modernizer whose fix changes program
+behavior to have a serious bug and will endeavor to fix it.
+
+To apply all modernization fixes en masse, you can use the
+following command:
+
+	$ go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest -fix -test ./...
+
+If the tool warns of conflicting fixes, you may need to run it more
+than once until it has applied all fixes cleanly. This command is
+not an officially supported interface and may change in the future.
+
+Changes produced by this tool should be reviewed as usual before
+being merged. In some cases, a loop may be replaced by a simple
+function call, causing comments within the loop to be discarded.
+Human judgment may be required to avoid losing comments of value.
+
+Each diagnostic reported by modernize has a specific category. (The
+categories are listed below.) Diagnostics in some categories, such
+as "efaceany" (which replaces "interface{}" with "any" where it is
+safe to do so) are particularly numerous. It may ease the burden of
+code review to apply fixes in two passes, the first change
+consisting only of fixes of category "efaceany", the second
+consisting of all others. This can be achieved using the -category flag:
+
+	$ modernize -category=efaceany  -fix -test ./...
+	$ modernize -category=-efaceany -fix -test ./...
+
+Categories of modernize diagnostic:
+
+  - minmax: replace an if/else conditional assignment by a call to
+    the built-in min or max functions added in go1.21.
+
+  - sortslice: replace sort.Slice(x, func(i, j int) bool) { return s[i] < s[j] }
+    by a call to slices.Sort(s), added in go1.21.
+
+  - efaceany: replace interface{} by the 'any' type added in go1.18.
+
+  - slicesclone: replace append([]T(nil), s...) by slices.Clone(s) or
+    slices.Concat(s), added in go1.21.
+
+  - mapsloop: replace a loop around an m[k]=v map update by a call
+    to one of the Collect, Copy, Clone, or Insert functions from
+    the maps package, added in go1.21.
+
+  - fmtappendf: replace []byte(fmt.Sprintf...) by fmt.Appendf(nil, ...),
+    added in go1.19.
+
+  - testingcontext: replace uses of context.WithCancel in tests
+    with t.Context, added in go1.24.
+
+  - omitzero: replace omitempty by omitzero on structs, added in go1.24.
+
+  - bloop: replace "for i := range b.N" or "for range b.N" in a
+    benchmark with "for b.Loop()", and remove any preceding calls
+    to b.StopTimer, b.StartTimer, and b.ResetTimer.
+
+  - slicesdelete: replace append(s[:i], s[i+1]...) by
+    slices.Delete(s, i, i+1), added in go1.21.
+
+  - rangeint: replace a 3-clause "for i := 0; i < n; i++" loop by
+    "for i := range n", added in go1.22.
+
+  - stringseq: replace Split in "for range strings.Split(...)" by go1.24's
+    more efficient SplitSeq, or Fields with FieldSeq.
+
+Default: on.
+
+Package documentation: [modernize](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/modernize)
 
 <a id='nilfunc'></a>
 ## `nilfunc`: check for useless comparisons between functions and nil
@@ -796,42 +914,6 @@ Default: on.
 
 Package documentation: [structtag](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/structtag)
 
-<a id='stubmethods'></a>
-## `stubmethods`: detect missing methods and fix with stub implementations
-
-
-This analyzer detects type-checking errors due to missing methods
-in assignments from concrete types to interface types, and offers
-a suggested fix that will create a set of stub methods so that
-the concrete type satisfies the interface.
-
-For example, this function will not compile because the value
-NegativeErr{} does not implement the "error" interface:
-
-	func sqrt(x float64) (float64, error) {
-		if x < 0 {
-			return 0, NegativeErr{} // error: missing method
-		}
-		...
-	}
-
-	type NegativeErr struct{}
-
-This analyzer will suggest a fix to declare this method:
-
-	// Error implements error.Error.
-	func (NegativeErr) Error() string {
-		panic("unimplemented")
-	}
-
-(At least, it appears to behave that way, but technically it
-doesn't use the SuggestedFix mechanism and the stub is created by
-logic in gopls's golang.stub function.)
-
-Default: on.
-
-Package documentation: [stubmethods](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/stubmethods)
-
 <a id='testinggoroutine'></a>
 ## `testinggoroutine`: report calls to (*testing.T).Fatal from goroutines started by a test
 
@@ -878,26 +960,6 @@ Default: on.
 
 Package documentation: [timeformat](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/timeformat)
 
-<a id='undeclaredname'></a>
-## `undeclaredname`: suggested fixes for "undeclared name: <>"
-
-
-This checker provides suggested fixes for type errors of the
-type "undeclared name: <>". It will either insert a new statement,
-such as:
-
-	<> :=
-
-or a new function declaration, such as:
-
-	func <>(inferred parameters) {
-		panic("implement me!")
-	}
-
-Default: on.
-
-Package documentation: [undeclaredname](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/undeclaredname)
-
 <a id='unmarshal'></a>
 ## `unmarshal`: report passing non-pointer or non-interface values to unmarshal
 
@@ -914,7 +976,7 @@ Package documentation: [unmarshal](https://pkg.go.dev/golang.org/x/tools/go/anal
 
 
 The unreachable analyzer finds statements that execution can never reach
-because they are preceded by an return statement, a call to panic, an
+because they are preceded by a return statement, a call to panic, an
 infinite loop, or similar constructs.
 
 Default: on.
@@ -934,6 +996,54 @@ invisible to stack copying and to the garbage collector.
 Default: on.
 
 Package documentation: [unsafeptr](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/unsafeptr)
+
+<a id='unusedfunc'></a>
+## `unusedfunc`: check for unused functions and methods
+
+
+The unusedfunc analyzer reports functions and methods that are
+never referenced outside of their own declaration.
+
+A function is considered unused if it is unexported and not
+referenced (except within its own declaration).
+
+A method is considered unused if it is unexported, not referenced
+(except within its own declaration), and its name does not match
+that of any method of an interface type declared within the same
+package.
+
+The tool may report false positives in some situations, for
+example:
+
+  - For a declaration of an unexported function that is referenced
+    from another package using the go:linkname mechanism, if the
+    declaration's doc comment does not also have a go:linkname
+    comment.
+
+    (Such code is in any case strongly discouraged: linkname
+    annotations, if they must be used at all, should be used on both
+    the declaration and the alias.)
+
+  - For compiler intrinsics in the "runtime" package that, though
+    never referenced, are known to the compiler and are called
+    indirectly by compiled object code.
+
+  - For functions called only from assembly.
+
+  - For functions called only from files whose build tags are not
+    selected in the current build configuration.
+
+See https://github.com/golang/go/issues/71686 for discussion of
+these limitations.
+
+The unusedfunc algorithm is not as precise as the
+golang.org/x/tools/cmd/deadcode tool, but it has the advantage that
+it runs within the modular analysis framework, enabling near
+real-time feedback within gopls.
+
+Default: on.
+
+Package documentation: [unusedfunc](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/unusedfunc)
 
 <a id='unusedparams'></a>
 ## `unusedparams`: check for unused parameters of functions
@@ -962,6 +1072,8 @@ arguments at call sites, while taking care to preserve any side
 effects in the argument expressions; see
 https://github.com/golang/tools/releases/tag/gopls%2Fv0.14.
 
+This analyzer ignores generated code.
+
 Default: on.
 
 Package documentation: [unusedparams](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/unusedparams)
@@ -987,7 +1099,7 @@ Package documentation: [unusedresult](https://pkg.go.dev/golang.org/x/tools/go/a
 
 
 
-Default: off. Enable by setting `"analyses": {"unusedvariable": true}`.
+Default: on.
 
 Package documentation: [unusedvariable](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/unusedvariable)
 
@@ -1023,13 +1135,70 @@ Default: on.
 
 Package documentation: [unusedwrite](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/unusedwrite)
 
-<a id='useany'></a>
-## `useany`: check for constraints that could be simplified to "any"
+<a id='waitgroup'></a>
+## `waitgroup`: check for misuses of sync.WaitGroup
 
 
+This analyzer detects mistaken calls to the (*sync.WaitGroup).Add
+method from inside a new goroutine, causing Add to race with Wait:
 
-Default: off. Enable by setting `"analyses": {"useany": true}`.
+	// WRONG
+	var wg sync.WaitGroup
+	go func() {
+	        wg.Add(1) // "WaitGroup.Add called from inside new goroutine"
+	        defer wg.Done()
+	        ...
+	}()
+	wg.Wait() // (may return prematurely before new goroutine starts)
 
-Package documentation: [useany](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/useany)
+The correct code calls Add before starting the goroutine:
+
+	// RIGHT
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		...
+	}()
+	wg.Wait()
+
+Default: on.
+
+Package documentation: [waitgroup](https://pkg.go.dev/golang.org/x/tools/go/analysis/passes/waitgroup)
+
+<a id='yield'></a>
+## `yield`: report calls to yield where the result is ignored
+
+
+After a yield function returns false, the caller should not call
+the yield function again; generally the iterator should return
+promptly.
+
+This example fails to check the result of the call to yield,
+causing this analyzer to report a diagnostic:
+
+	yield(1) // yield may be called again (on L2) after returning false
+	yield(2)
+
+The corrected code is either this:
+
+	if yield(1) { yield(2) }
+
+or simply:
+
+	_ = yield(1) && yield(2)
+
+It is not always a mistake to ignore the result of yield.
+For example, this is a valid single-element iterator:
+
+	yield(1) // ok to ignore result
+	return
+
+It is only a mistake when the yield call that returned false may be
+followed by another call.
+
+Default: on.
+
+Package documentation: [yield](https://pkg.go.dev/golang.org/x/tools/gopls/internal/analysis/yield)
 
 <!-- END Analyzers: DO NOT MANUALLY EDIT THIS SECTION -->

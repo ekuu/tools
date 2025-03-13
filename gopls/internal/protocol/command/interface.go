@@ -16,6 +16,8 @@ package command
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
 	"golang.org/x/tools/gopls/internal/protocol"
 	"golang.org/x/tools/gopls/internal/vulncheck"
@@ -45,19 +47,7 @@ type Interface interface {
 	// Applies a fix to a region of source code.
 	ApplyFix(context.Context, ApplyFixArgs) (*protocol.WorkspaceEdit, error)
 
-	// Test: Run test(s) (legacy)
-	//
-	// Runs `go test` for a specific set of test or benchmark functions.
-	//
-	// This command is asynchronous; wait for the 'end' progress notification.
-	//
-	// This command is an alias for RunTests; the only difference
-	// is the form of the parameters.
-	//
-	// TODO(adonovan): eliminate it.
-	Test(context.Context, protocol.DocumentURI, []string, []string) error
-
-	// Test: Run test(s)
+	// RunTests: Run tests
 	//
 	// Runs `go test` for a specific set of test or benchmark functions.
 	//
@@ -73,7 +63,7 @@ type Interface interface {
 	//
 	// Opens the Go package documentation page for the current
 	// package in a browser.
-	Doc(context.Context, protocol.Location) error
+	Doc(context.Context, DocArgs) (protocol.URI, error)
 
 	// RegenerateCgo: Regenerate cgo
 	//
@@ -130,17 +120,15 @@ type Interface interface {
 	// Runs `go get` to fetch a package.
 	GoGetPackage(context.Context, GoGetPackageArgs) error
 
-	// GCDetails: Toggle gc_details
+	// GCDetails: Toggle display of compiler optimization details
 	//
-	// Toggle the calculation of gc annotations.
+	// Toggle the per-package flag that causes Go compiler
+	// optimization decisions to be reported as diagnostics.
+	//
+	// (The name is a legacy of a time when the Go compiler was
+	// known as "gc". Renaming the command would break custom
+	// client-side logic in VS Code.)
 	GCDetails(context.Context, protocol.DocumentURI) error
-
-	// TODO: deprecate GCDetails in favor of ToggleGCDetails below.
-
-	// ToggleGCDetails: Toggle gc_details
-	//
-	// Toggle the calculation of gc annotations.
-	ToggleGCDetails(context.Context, URIArg) error
 
 	// ListKnownPackages: List known packages
 	//
@@ -186,16 +174,30 @@ type Interface interface {
 	// runner.
 	StopProfile(context.Context, StopProfileArgs) (StopProfileResult, error)
 
-	// RunGovulncheck: Run vulncheck
+	// GoVulncheck: run vulncheck synchronously.
 	//
 	// Run vulnerability check (`govulncheck`).
 	//
-	// This command is asynchronous; clients must wait for the 'end' progress notification.
+	// This command is synchronous, and returns the govulncheck result.
+	Vulncheck(context.Context, VulncheckArgs) (VulncheckResult, error)
+
+	// RunGovulncheck: Run vulncheck asynchronously.
+	//
+	// Run vulnerability check (`govulncheck`).
+	//
+	// This command is asynchronous; clients must wait for the 'end' progress
+	// notification and then retrieve results using gopls.fetch_vulncheck_result.
+	//
+	// Deprecated: clients should call gopls.vulncheck instead, which returns the
+	// actual vulncheck result.
 	RunGovulncheck(context.Context, VulncheckArgs) (RunVulncheckResult, error)
 
 	// FetchVulncheckResult: Get known vulncheck result
 	//
 	// Fetch the result of latest vulnerability check (`govulncheck`).
+	//
+	// Deprecated: clients should call gopls.vulncheck instead, which returns the
+	// actual vulncheck result.
 	FetchVulncheckResult(context.Context, URIArg) (map[protocol.DocumentURI]*vulncheck.Result, error)
 
 	// MemStats: Fetch memory statistics
@@ -223,6 +225,9 @@ type Interface interface {
 	// Gopls will prepend "fwd/" to all the counters updated using this command
 	// to avoid conflicts with other counters gopls collects.
 	AddTelemetryCounters(context.Context, AddTelemetryCountersArgs) error
+
+	// AddTest: add test for the selected function
+	AddTest(context.Context, protocol.Location) (*protocol.WorkspaceEdit, error)
 
 	// MaybePromptForTelemetry: Prompt user to enable telemetry
 	//
@@ -282,11 +287,16 @@ type Interface interface {
 
 	// Modules: Return information about modules within a directory
 	//
-	// This command returns an empty result if there is no module,
-	// or if module mode is disabled.
-	// The result does not includes the modules that are not
-	// associated with any Views on the server yet.
+	// This command returns an empty result if there is no module, or if module
+	// mode is disabled. Modules will not cause any new views to be loaded and
+	// will only return modules associated with views that have already been
+	// loaded, regardless of how it is called. Given current usage (by the
+	// language server client), there should never be a case where Modules is
+	// called on a path that has not already been loaded.
 	Modules(context.Context, ModulesArgs) (ModulesResult, error)
+
+	// PackageSymbols: Return information about symbols in the given file's package.
+	PackageSymbols(context.Context, PackageSymbolsArgs) (PackageSymbolsResult, error)
 }
 
 type RunTestsArgs struct {
@@ -308,6 +318,11 @@ type GenerateArgs struct {
 	Recursive bool
 }
 
+type DocArgs struct {
+	Location     protocol.Location
+	ShowDocument bool // in addition to returning the URL, send showDocument
+}
+
 // TODO(rFindley): document the rest of these once the docgen is fleshed out.
 
 type ApplyFixArgs struct {
@@ -321,10 +336,9 @@ type ApplyFixArgs struct {
 	// upon by the code action and golang.ApplyFix.
 	Fix string
 
-	// The file URI for the document to fix.
-	URI protocol.DocumentURI
-	// The document range to scan for fixes.
-	Range protocol.Range
+	// The portion of the document to fix.
+	Location protocol.Location
+
 	// Whether to resolve and return the edits.
 	ResolveEdits bool
 }
@@ -500,20 +514,14 @@ type RunVulncheckResult struct {
 	Token protocol.ProgressToken
 }
 
-// CallStack models a trace of function calls starting
-// with a client function or method and ending with a
-// call to a vulnerable symbol.
-type CallStack []StackEntry
-
-// StackEntry models an element of a call stack.
-type StackEntry struct {
-	// See golang.org/x/exp/vulncheck.StackEntry.
-
-	// User-friendly representation of function/method names.
-	// e.g. package.funcName, package.(recvType).methodName, ...
-	Name string
-	URI  protocol.DocumentURI
-	Pos  protocol.Position // Start position. (0-based. Column is always 0)
+// VulncheckResult holds the result of synchronously running the vulncheck
+// command.
+type VulncheckResult struct {
+	// Result holds the result of running vulncheck.
+	Result *vulncheck.Result
+	// Token holds the progress token used to report progress during back to the
+	// LSP client during vulncheck execution.
+	Token protocol.ProgressToken
 }
 
 // MemStatsResult holds selected fields from runtime.MemStats.
@@ -568,10 +576,66 @@ type AddTelemetryCountersArgs struct {
 }
 
 // ChangeSignatureArgs specifies a "change signature" refactoring to perform.
+//
+// The new signature is expressed via the NewParams and NewResults fields. The
+// elements of these lists each describe a new field of the signature, by
+// either referencing a field in the old signature or by defining a new field:
+//   - If the element is an integer, it references a positional parameter in the
+//     old signature.
+//   - If the element is a string, it is parsed as a new field to add.
+//
+// Suppose we have a function `F(a, b int) (string, error)`. Here are some
+// examples of refactoring this signature in practice, eliding the 'Location'
+// and 'ResolveEdits' fields.
+//   - `{ "NewParams": [0], "NewResults": [0, 1] }` removes the second parameter
+//   - `{ "NewParams": [1, 0], "NewResults": [0, 1] }` flips the parameter order
+//   - `{ "NewParams": [0, 1, "a int"], "NewResults": [0, 1] }` adds a new field
+//   - `{ "NewParams": [1, 2], "NewResults": [1] }` drops the `error` result
 type ChangeSignatureArgs struct {
-	RemoveParameter protocol.Location
+	// Location is any range inside the function signature. By convention, this
+	// is the same location provided in the codeAction request.
+	Location protocol.Location // a range inside of the function signature, as passed to CodeAction
+
+	// NewParams describes parameters of the new signature.
+	// An int value references a parameter in the old signature by index.
+	// A string value describes a new parameter field (e.g. "x int").
+	NewParams []ChangeSignatureParam
+
+	// NewResults describes results of the new signature (see above).
+	// An int value references a result in the old signature by index.
+	// A string value describes a new result field (e.g. "err error").
+	NewResults []ChangeSignatureParam
+
 	// Whether to resolve and return the edits.
 	ResolveEdits bool
+}
+
+// ChangeSignatureParam implements the API described in the doc string of
+// [ChangeSignatureArgs]: a union of JSON int | string.
+type ChangeSignatureParam struct {
+	OldIndex int
+	NewField string
+}
+
+func (a *ChangeSignatureParam) UnmarshalJSON(b []byte) error {
+	var s string
+	if err := json.Unmarshal(b, &s); err == nil {
+		a.NewField = s
+		return nil
+	}
+	var i int
+	if err := json.Unmarshal(b, &i); err == nil {
+		a.OldIndex = i
+		return nil
+	}
+	return fmt.Errorf("must be int or string")
+}
+
+func (a ChangeSignatureParam) MarshalJSON() ([]byte, error) {
+	if a.NewField != "" {
+		return json.Marshal(a.NewField)
+	}
+	return json.Marshal(a.OldIndex)
 }
 
 // DiagnoseFilesArgs specifies a set of files for which diagnostics are wanted.
@@ -597,7 +661,7 @@ type PackagesArgs struct {
 	// the result may describe any of them.
 	Files []protocol.DocumentURI
 
-	// Enumerate all packages under the directry loadable with
+	// Enumerate all packages under the directory loadable with
 	// the ... pattern.
 	// The search does not cross the module boundaries and
 	// does not return packages that are not yet loaded.
@@ -623,7 +687,7 @@ type PackagesResult struct {
 	// Packages is an unordered list of package metadata.
 	Packages []Package
 
-	// Modules maps module path to module metadata for
+	// Module maps module path to module metadata for
 	// all the modules of the returned Packages.
 	Module map[string]Module
 }
@@ -635,6 +699,8 @@ type Package struct {
 	// Module path. Empty if the package doesn't
 	// belong to any module.
 	ModulePath string
+	// q in a "p [q.test]" package.
+	ForTest string
 
 	// Note: the result does not include the directory name
 	// of the package because mapping between a package and
@@ -681,7 +747,7 @@ type TestCase struct {
 	// analysis; if so, it should aim to simulate the actual computed
 	// name of the test, including any disambiguating suffix such as "#01".
 	// To run only this test, clients need to compute the -run, -bench, -fuzz
-	// flag values by first splitting the Name with “/” and
+	// flag values by first splitting the Name with "/" and
 	// quoting each element with "^" + regexp.QuoteMeta(Name) + "$".
 	// e.g. TestToplevel/Inner.Subtest → -run=^TestToplevel$/^Inner\.Subtest$
 	Name string
@@ -728,4 +794,39 @@ type ModulesArgs struct {
 
 type ModulesResult struct {
 	Modules []Module
+}
+
+type PackageSymbolsArgs struct {
+	URI protocol.DocumentURI
+}
+
+type PackageSymbolsResult struct {
+	PackageName string
+	// Files is a list of files in the given URI's package.
+	Files   []protocol.DocumentURI
+	Symbols []PackageSymbol
+}
+
+// PackageSymbol has the same fields as DocumentSymbol, with an additional int field "File"
+// which stores the index of the symbol's file in the PackageSymbolsResult.Files array
+type PackageSymbol struct {
+	Name string `json:"name"`
+
+	Detail string `json:"detail,omitempty"`
+
+	// protocol.SymbolKind maps an integer to an enum:
+	// https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#symbolKind
+	// i.e. File = 1
+	Kind protocol.SymbolKind `json:"kind"`
+
+	Tags []protocol.SymbolTag `json:"tags,omitempty"`
+
+	Range protocol.Range `json:"range"`
+
+	SelectionRange protocol.Range `json:"selectionRange"`
+
+	Children []PackageSymbol `json:"children,omitempty"`
+
+	// Index of this symbol's file in PackageSymbolsResult.Files
+	File int `json:"file,omitempty"`
 }

@@ -20,8 +20,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"golang.org/x/tools/go/packages/packagestest"
 	"golang.org/x/tools/internal/gocommand"
+	"golang.org/x/tools/internal/packagestest"
 	"golang.org/x/tools/internal/stdlib"
 )
 
@@ -1652,9 +1652,9 @@ var _ = bytes.Buffer
 }
 
 func TestStdlibSelfImports(t *testing.T) {
-	const input = `package ecdsa
+	const input = `package rc4
 
-var _ = ecdsa.GenerateKey
+var _ = rc4.NewCipher
 `
 
 	testConfig{
@@ -1663,7 +1663,7 @@ var _ = ecdsa.GenerateKey
 			Files: fm{"x.go": "package x"},
 		},
 	}.test(t, func(t *goimportTest) {
-		got, err := t.processNonModule(filepath.Join(t.goroot, "src/crypto/ecdsa/foo.go"), []byte(input), nil)
+		got, err := t.processNonModule(filepath.Join(t.goroot, "src/crypto/rc4/foo.go"), []byte(input), nil)
 		if err != nil {
 			t.Fatalf("Process() = %v", err)
 		}
@@ -1680,7 +1680,7 @@ type testConfig struct {
 }
 
 // fm is the type for a packagestest.Module's Files, abbreviated for shorter lines.
-type fm map[string]interface{}
+type fm map[string]any
 
 func (c testConfig) test(t *testing.T, fn func(*goimportTest)) {
 	t.Helper()
@@ -2513,7 +2513,7 @@ func TestPkgIsCandidate(t *testing.T) {
 	}
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			refs := references{tt.pkgIdent: nil}
+			refs := References{tt.pkgIdent: nil}
 			got := pkgIsCandidate(tt.filename, refs, tt.pkg)
 			if got != tt.want {
 				t.Errorf("test %d. pkgIsCandidate(%q, %q, %+v) = %v; want %v",
